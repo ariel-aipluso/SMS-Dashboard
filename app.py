@@ -7,14 +7,14 @@ from datetime import datetime, timedelta
 import re
 
 st.set_page_config(
-    page_title="AROS SMS Campaign Analytics",
+    page_title="SMS Campaign Analytics",
     page_icon="📱",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-st.title("📱 AROS SMS Campaign Analytics Dashboard")
-st.markdown("*Alliance to Reclaim Our Schools - Daisychain SMS Outreach Analysis*")
+st.title("📱 SMS Campaign Analytics Dashboard")
+st.markdown("*Interactive SMS Campaign Analysis Tool*")
 
 # File upload section
 st.sidebar.header("📂 Data Upload")
@@ -142,7 +142,7 @@ if messages_file and people_file:
                         after_ai = opt_out_timing.get("After AI Response", 0)
                         st.metric("Opted out after 1st static message", f"{after_static}/{len(opted_out_people)}")
                         if after_static > after_ai:
-                            st.warning("⚠️ Most opt-outs happen before Ed (AI) even responds")
+                            st.warning("⚠️ Most opt-outs happen before AI even responds")
 
         # Network multiplier detection
         st.header("🌐 Network Multiplier Detection")

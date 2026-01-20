@@ -1,6 +1,6 @@
-# AROS SMS Campaign Analytics Dashboard
+# SMS Campaign Analytics Dashboard
 
-An interactive Streamlit dashboard for analyzing SMS outreach campaigns from Daisychain, built for the Alliance to Reclaim Our Schools (AROS).
+An interactive Streamlit dashboard for analyzing SMS outreach campaigns with CSV data uploads.
 
 ## Features
 
@@ -13,7 +13,7 @@ An interactive Streamlit dashboard for analyzing SMS outreach campaigns from Dai
 
 ## Key Insights
 
-The dashboard reveals that **16 of 17 opt-outs occurred after the 1st static message** (before the Ed AI bot even responded), highlighting the importance of the initial outreach message.
+The dashboard analyzes opt-out timing to reveal when people disengage relative to static vs AI responses, highlighting the importance of initial message optimization.
 
 ## Setup Instructions
 
@@ -30,7 +30,7 @@ The dashboard reveals that **16 of 17 opt-outs occurred after the 1st static mes
    ```
 
 4. **Upload your data**:
-   - Export your Messages and People data from Daisychain as CSV files
+   - Export your Messages and People data as CSV files from your SMS platform
    - Upload both files using the sidebar file uploaders
 
 ## Data Requirements
@@ -52,10 +52,10 @@ Optional columns:
 
 ## Context
 
-This dashboard is designed for SMS campaigns using:
-- **Daisychain**: SMS platform for outreach
-- **Ed AI Bot**: Sends initial static message, then responds dynamically
-- **CSV Exports**: Since Daisychain API doesn't expose message/conversation endpoints
+This dashboard is designed for SMS campaigns with:
+- **SMS Platform Integration**: Works with any platform that can export CSV data
+- **AI Bot Analysis**: Analyzes static vs dynamic response patterns
+- **CSV-Based Analysis**: Import data from any SMS platform export
 
 ## Usage Notes
 
@@ -66,4 +66,4 @@ This dashboard is designed for SMS campaigns using:
 
 ## Support
 
-For questions about this dashboard or AROS campaigns, please contact the AROS technical team.
+For questions about this dashboard, please open an issue in this repository or contact the development team.
