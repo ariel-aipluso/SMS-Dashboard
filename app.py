@@ -39,7 +39,7 @@ if messages_file and people_file:
         # Data overview
         st.header("📊 Campaign Summary")
 
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
 
         # Calculate metrics - exclude people without phone numbers
         # Find people with valid phone numbers
@@ -72,20 +72,31 @@ if messages_file and people_file:
             contactable_recipients = len(people_df)
 
         total_recipients = len(people_df)
-        responded_people = messages_df[messages_df['direction'] == 'incoming']['person_id'].nunique()
-        response_rate = (responded_people / contactable_recipients * 100) if contactable_recipients > 0 else 0
 
-        # Opt-outs - detect from STOP messages
+        # Calculate opt-outs first
         stop_keywords = ['stop', 'unsubscribe', 'opt out', 'opt-out', 'remove', 'quit', 'cancel']
+        opted_out_people_set = set()
 
         if 'body' in messages_df.columns:
             incoming_stop_messages = messages_df[
                 (messages_df['direction'] == 'incoming') &
                 (messages_df['body'].str.lower().str.contains('|'.join(stop_keywords), na=False))
             ]
-            opt_outs = incoming_stop_messages['person_id'].nunique()
+            opted_out_people_set = set(incoming_stop_messages['person_id'].unique())
+            opt_outs = len(opted_out_people_set)
         else:
             opt_outs = 0
+
+        # Calculate responders
+        all_responders = set(messages_df[messages_df['direction'] == 'incoming']['person_id'].unique())
+        total_responders = len(all_responders)
+
+        # Calculate active responders (responded but didn't opt out)
+        active_responders_set = all_responders - opted_out_people_set
+        active_responders = len(active_responders_set)
+
+        # Response rate based on total responders
+        response_rate = (total_responders / contactable_recipients * 100) if contactable_recipients > 0 else 0
 
         with col1:
             st.metric("Total Recipients", f"{total_recipients:,}")
@@ -95,15 +106,22 @@ if messages_file and people_file:
             st.metric("Response Rate", f"{response_rate:.1f}%")
             st.caption(f"Based on {contactable_recipients:,} textable numbers")
         with col3:
-            st.metric("Responders", f"{responded_people:,}")
+            st.metric("Total Responders", f"{total_responders:,}")
         with col4:
             st.metric("Opt-outs", f"{opt_outs:,}")
+        with col5:
+            st.metric("Active Responders", f"{active_responders:,}")
+            st.caption("Responded but didn't opt out")
 
         # Engagement depth analysis
         st.header("📈 Engagement Depth Analysis")
 
-        # Calculate response counts per person
-        person_response_counts = messages_df[messages_df['direction'] == 'incoming'].groupby('person_id').size().reset_index(name='response_count')
+        # Calculate response counts per person (exclude opt-outs from engagement analysis)
+        engaged_messages = messages_df[
+            (messages_df['direction'] == 'incoming') &
+            (~messages_df['person_id'].isin(opted_out_people_set))
+        ]
+        person_response_counts = engaged_messages.groupby('person_id').size().reset_index(name='response_count')
 
         # Create engagement buckets
         engagement_buckets = {
@@ -153,33 +171,16 @@ if messages_file and people_file:
             stop_messages = incoming_messages[incoming_messages['is_stop']]
             opted_out_people = stop_messages['person_id'].unique().tolist()
 
-            st.info(f"Found {len(opted_out_people)} people who sent STOP messages")
-
-            if len(stop_messages) > 0:
-                # Show sample stop messages with names
-                with st.expander("Sample STOP Messages"):
-                    # Use the same name lookup function as the responder details
-                    def get_display_name(person_id):
-                        if 'name' in people_df.columns:
-                            person_row = people_df[people_df['id'] == person_id]
-                            if not person_row.empty and pd.notna(person_row['name'].iloc[0]):
-                                return f"{person_row['name'].iloc[0]} (ID: {person_id})"
-                        elif 'first_name' in people_df.columns or 'last_name' in people_df.columns:
-                            person_row = people_df[people_df['id'] == person_id]
-                            if not person_row.empty:
-                                first_name = person_row.get('first_name', pd.Series([None])).iloc[0] if 'first_name' in people_df.columns else ""
-                                last_name = person_row.get('last_name', pd.Series([None])).iloc[0] if 'last_name' in people_df.columns else ""
-                                if pd.notna(first_name) or pd.notna(last_name):
-                                    full_name = f"{first_name or ''} {last_name or ''}".strip()
-                                    return f"{full_name} (ID: {person_id})"
-                        return f"Person {person_id}"
-
-                    for _, msg in stop_messages.head(5).iterrows():
-                        person_display = get_display_name(msg['person_id'])
-                        st.text(f"{person_display}: {msg['body']}")
-
             if opted_out_people:
-                st.info(f"Analyzing {len(opted_out_people)} people who opted out...")
+                # Summary stats first (matching committed responders format)
+                col1, col2 = st.columns(2)
+                with col1:
+                    total_opt_outs = len(opted_out_people)
+                    st.metric("Opt-outs", f"{total_opt_outs}")
+                with col2:
+                    opt_out_rate = (total_opt_outs / contactable_recipients * 100) if contactable_recipients > 0 else 0
+                    st.metric("Opt-out Rate", f"{opt_out_rate:.1f}%")
+                    st.caption("% of textable numbers who sent STOP")
 
                 # Analyze message sequence position when people opt out
                 opt_out_positions = []
@@ -229,38 +230,40 @@ if messages_file and people_file:
                                 'stop_time': stop_time
                             })
 
-                if opt_out_positions:
-                    position_counts = pd.Series(opt_out_positions).value_counts()
+                # Collapsible detailed analysis section
+                with st.expander(f"View {len(opted_out_people)} Opt-out Analysis Details"):
+                    if opt_out_positions:
+                        position_counts = pd.Series(opt_out_positions).value_counts()
 
-                    col1, col2 = st.columns(2)
+                        col1, col2 = st.columns(2)
 
-                    with col1:
-                        fig = px.bar(
-                            x=position_counts.index,
-                            y=position_counts.values,
-                            title="Opt-out Position in Message Sequence",
-                            labels={'x': 'Message Position', 'y': 'Number of Opt-outs'}
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
+                        with col1:
+                            fig = px.bar(
+                                x=position_counts.index,
+                                y=position_counts.values,
+                                title="Opt-out Position in Message Sequence",
+                                labels={'x': 'Message Position', 'y': 'Number of Opt-outs'}
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
 
-                    with col2:
-                        st.subheader("Key Insights")
+                        with col2:
+                            st.subheader("Key Insights")
 
-                        # Calculate statistics
-                        opt_out_df = pd.DataFrame(opt_out_details)
-                        avg_messages = opt_out_df['messages_before_stop'].mean()
-                        avg_hours = opt_out_df['hours_elapsed'].mean()
+                            # Calculate statistics
+                            opt_out_df = pd.DataFrame(opt_out_details)
+                            avg_messages = opt_out_df['messages_before_stop'].mean()
+                            avg_hours = opt_out_df['hours_elapsed'].mean()
 
-                        st.metric("Average messages before STOP", f"{avg_messages:.1f}")
-                        st.metric("Average time to STOP", f"{avg_hours:.1f} hours")
+                            st.metric("Average messages before STOP", f"{avg_messages:.1f}")
+                            st.metric("Average time to STOP", f"{avg_hours:.1f} hours")
 
-                        # Early opt-outs warning
-                        early_opts = len(opt_out_df[opt_out_df['messages_before_stop'] == 1])
-                        if early_opts > 0:
-                            st.warning(f"⚠️ {early_opts} people stopped after just 1 message")
+                            # Early opt-outs warning
+                            early_opts = len(opt_out_df[opt_out_df['messages_before_stop'] == 1])
+                            if early_opts > 0:
+                                st.warning(f"⚠️ {early_opts} people stopped after just 1 message")
 
-                    # Detailed breakdown
-                    with st.expander("Detailed STOP Message Analysis"):
+                        # Detailed table
+                        st.subheader("Individual Opt-out Details")
                         opt_out_summary = pd.DataFrame(opt_out_details)
 
                         # Add person names to the summary
@@ -283,8 +286,77 @@ if messages_file and people_file:
 
                         display_cols = ['person_name', 'messages_before_stop', 'hours_rounded', 'stop_message']
                         st.dataframe(opt_out_summary[display_cols])
-                else:
-                    st.info("No STOP messages found in the conversation data")
+            else:
+                st.info("No STOP messages found in the conversation data")
+
+        # Committed responders detection
+        st.header("✅ Committed Responders")
+
+        commitment_keywords = ["yes", "i will", "i'll", "count me in", "sign me up", "i'm in", "absolutely", "definitely", "for sure", "commit", "committed", "attend", "participate", "join", "coming", "be there"]
+
+        if 'body' in messages_df.columns:
+            incoming_messages = messages_df[messages_df['direction'] == 'incoming']
+
+            # Find unique people who sent commitment messages with their first occurrence
+            committed_people = []
+            seen_people = set()
+
+            for _, msg in incoming_messages.iterrows():
+                if any(keyword in str(msg['body']).lower() for keyword in commitment_keywords):
+                    if msg['person_id'] not in seen_people:
+                        seen_people.add(msg['person_id'])
+
+                        # Get person name
+                        person_name = "Unknown"
+                        if 'name' in people_df.columns:
+                            person_row = people_df[people_df['id'] == msg['person_id']]
+                            if not person_row.empty and pd.notna(person_row['name'].iloc[0]):
+                                person_name = person_row['name'].iloc[0]
+                        elif 'first_name' in people_df.columns or 'last_name' in people_df.columns:
+                            person_row = people_df[people_df['id'] == msg['person_id']]
+                            if not person_row.empty:
+                                first_name = person_row.get('first_name', pd.Series([None])).iloc[0] if 'first_name' in people_df.columns else ""
+                                last_name = person_row.get('last_name', pd.Series([None])).iloc[0] if 'last_name' in people_df.columns else ""
+                                if pd.notna(first_name) or pd.notna(last_name):
+                                    person_name = f"{first_name or ''} {last_name or ''}".strip()
+
+                        if person_name == "Unknown" or person_name == "":
+                            person_name = f"Person {msg['person_id']}"
+
+                        committed_people.append({
+                            'person_name': person_name,
+                            'person_id': msg['person_id'],
+                            'commitment_date': msg['created_at'],
+                            'raw_message': msg['body']
+                        })
+
+            if committed_people:
+                # Summary stats first
+                col1, col2 = st.columns(2)
+                with col1:
+                    total_committed = len(committed_people)
+                    st.metric("Committed Responders", f"{total_committed}")
+                with col2:
+                    if total_committed > 0:
+                        commitment_rate = (total_committed / active_responders * 100) if active_responders > 0 else 0
+                        st.metric("Commitment Rate", f"{commitment_rate:.1f}%")
+                        st.caption("% of active responders who committed to action")
+
+                # Collapsible table section
+                with st.expander(f"View {len(committed_people)} Committed Responder Details"):
+                    # Display as a clean table
+                    committed_df = pd.DataFrame(committed_people)
+
+                    # Format the date for display
+                    committed_df['commitment_date_formatted'] = committed_df['commitment_date'].dt.strftime('%Y-%m-%d %H:%M')
+
+                    # Display table with raw message
+                    display_df = committed_df[['person_name', 'commitment_date_formatted', 'raw_message']].copy()
+                    display_df.columns = ['Person', 'Commitment Date', 'Message']
+
+                    st.dataframe(display_df, use_container_width=True)
+            else:
+                st.info("No action commitments detected in the conversation data")
 
         # Network multiplier detection
         st.header("🌐 Network Multiplier Detection")
@@ -294,36 +366,66 @@ if messages_file and people_file:
         if 'body' in messages_df.columns:
             incoming_messages = messages_df[messages_df['direction'] == 'incoming']
 
-            multiplier_messages = []
+            # Find unique people who sent multiplier messages with their first occurrence
+            multiplier_people = []
+            seen_people = set()
+
             for _, msg in incoming_messages.iterrows():
                 if any(keyword in str(msg['body']).lower() for keyword in multiplier_keywords):
-                    multiplier_messages.append(msg)
+                    if msg['person_id'] not in seen_people:
+                        seen_people.add(msg['person_id'])
 
-            if multiplier_messages:
-                st.success(f"🎯 Found {len(multiplier_messages)} potential network multiplier responses!")
-
-                # Show sample multiplier messages
-                with st.expander("View Network Multiplier Messages"):
-                    multiplier_df = pd.DataFrame(multiplier_messages)
-
-                    # Create name lookup function for this section
-                    def get_person_name(person_id):
+                        # Get person name
+                        person_name = "Unknown"
                         if 'name' in people_df.columns:
-                            person_row = people_df[people_df['id'] == person_id]
+                            person_row = people_df[people_df['id'] == msg['person_id']]
                             if not person_row.empty and pd.notna(person_row['name'].iloc[0]):
-                                return person_row['name'].iloc[0]
+                                person_name = person_row['name'].iloc[0]
                         elif 'first_name' in people_df.columns or 'last_name' in people_df.columns:
-                            person_row = people_df[people_df['id'] == person_id]
+                            person_row = people_df[people_df['id'] == msg['person_id']]
                             if not person_row.empty:
                                 first_name = person_row.get('first_name', pd.Series([None])).iloc[0] if 'first_name' in people_df.columns else ""
                                 last_name = person_row.get('last_name', pd.Series([None])).iloc[0] if 'last_name' in people_df.columns else ""
                                 if pd.notna(first_name) or pd.notna(last_name):
-                                    return f"{first_name or ''} {last_name or ''}".strip()
-                        return f"Person {person_id}"
+                                    person_name = f"{first_name or ''} {last_name or ''}".strip()
 
-                    for _, msg in multiplier_df.head(10).iterrows():
-                        person_display = get_person_name(msg['person_id'])
-                        st.text(f"{person_display}: {msg['body']}")
+                        if person_name == "Unknown" or person_name == "":
+                            person_name = f"Person {msg['person_id']}"
+
+                        multiplier_people.append({
+                            'person_name': person_name,
+                            'person_id': msg['person_id'],
+                            'commitment_date': msg['created_at'],
+                            'raw_message': msg['body']
+                        })
+
+            if multiplier_people:
+                # Summary stats first
+                col1, col2 = st.columns(2)
+                with col1:
+                    total_multipliers = len(multiplier_people)
+                    st.metric("Network Multipliers", f"{total_multipliers}")
+                with col2:
+                    if total_multipliers > 0:
+                        multiplier_rate = (total_multipliers / active_responders * 100) if active_responders > 0 else 0
+                        st.metric("Multiplier Rate", f"{multiplier_rate:.1f}%")
+                        st.caption("% of active responders who committed to connecting others")
+
+                # Collapsible table section
+                with st.expander(f"View {len(multiplier_people)} Network Multiplier Details"):
+                    # Display as a clean table
+                    multiplier_df = pd.DataFrame(multiplier_people)
+
+                    # Format the date for display
+                    multiplier_df['commitment_date_formatted'] = multiplier_df['commitment_date'].dt.strftime('%Y-%m-%d %H:%M')
+
+                    # Display table with raw message
+                    display_df = multiplier_df[['person_name', 'commitment_date_formatted', 'raw_message']].copy()
+                    display_df.columns = ['Person', 'Commitment Date', 'Message']
+
+                    st.dataframe(display_df, use_container_width=True)
+            else:
+                st.info("No network multiplier commitments detected in the conversation data")
 
         # Tag-based segment comparison
         st.header("🏷️ Tag-Based Segment Analysis")
