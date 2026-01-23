@@ -37,6 +37,19 @@ def normalize_phone(phone):
         s = s[1:]
     return s
 
+
+def is_valid_phone(phone):
+    """Check if a phone value is a valid, non-empty phone number."""
+    if pd.isna(phone):
+        return False
+    s = str(phone).strip().lower()
+    # Check for empty or placeholder values
+    if s == '' or s in ('nan', 'none', 'null', 'n/a', 'na', '-'):
+        return False
+    # Must have at least some digits to be a phone number
+    digits = ''.join(c for c in s if c.isdigit())
+    return len(digits) >= 7  # Minimum reasonable phone number length
+
 def get_person_name(person_id, people_df):
     """Get display name for a person, checking first_name/last_name before name column."""
     person_row = people_df[people_df['id'] == person_id]
@@ -218,22 +231,21 @@ if messages_file and people_file:
 
         # Calculate metrics - exclude people without phone numbers
         # Find people with valid phone numbers
-        people_with_phones = people_df.copy()
-        phone_column = None
+        phone_col_candidates = ['phone', 'phone_number', 'mobile', 'cell']
 
-        # Detect phone column
-        for phone_col in ['phone', 'phone_number', 'mobile', 'cell']:
-            if phone_col in people_df.columns:
-                phone_column = phone_col
-                break
+        # Find which phone columns exist in the data
+        available_phone_cols = [col for col in phone_col_candidates if col in people_df.columns]
 
-        if phone_column:
-            # Filter to only people with non-empty phone numbers
-            people_with_phones = people_df[
-                people_df[phone_column].notna() &
-                (people_df[phone_column] != '') &
-                (people_df[phone_column].astype(str).str.strip() != '')
-            ]
+        if available_phone_cols:
+            # Check if person has a valid phone in ANY of the available columns
+            def has_valid_phone(row):
+                for col in available_phone_cols:
+                    if is_valid_phone(row[col]):
+                        return True
+                return False
+
+            # Filter to people with at least one valid phone number
+            people_with_phones = people_df[people_df.apply(has_valid_phone, axis=1)]
 
             # Also exclude landline and fixed VoIP numbers that can't receive SMS
             if 'phone_number_type' in people_df.columns:
@@ -244,7 +256,11 @@ if messages_file and people_file:
             contactable_recipients = len(people_with_phones)
         else:
             # If no phone column found, assume all can be contacted
+            people_with_phones = people_df
             contactable_recipients = len(people_df)
+
+        # Get IDs of textable people for filtering responders
+        textable_people_ids = set(people_with_phones['id'].tolist())
 
         total_recipients = len(people_df)
 
@@ -262,20 +278,22 @@ if messages_file and people_file:
         else:
             opt_outs = 0
 
-        # Calculate responders
+        # Calculate responders - only count those who are in the textable list
         all_responders = set(messages_df[messages_df['direction'] == 'incoming']['person_id'].unique())
-        total_responders = len(all_responders)
+        # Filter to only count responders who were textable
+        textable_responders = all_responders & textable_people_ids
+        total_responders = len(textable_responders)
 
         # Calculate active responders (responded but didn't opt out)
-        active_responders_set = all_responders - opted_out_people_set
+        active_responders_set = textable_responders - opted_out_people_set
         active_responders = len(active_responders_set)
 
-        # Response rate based on total responders
+        # Response rate based on textable responders (can never exceed 100%)
         response_rate = (total_responders / contactable_recipients * 100) if contactable_recipients > 0 else 0
 
         with col1:
             st.metric("Total Recipients", f"{total_recipients:,}")
-            if phone_column and contactable_recipients != total_recipients:
+            if available_phone_cols and contactable_recipients != total_recipients:
                 st.caption(f"📱 {contactable_recipients:,} with textable phone numbers")
         with col2:
             st.metric("Response Rate", f"{response_rate:.1f}%")
@@ -611,31 +629,12 @@ if messages_file and people_file:
         st.header("📤 Export Non-Responders")
 
         # Calculate non-responders (only from contactable people)
-        # Use the same phone detection logic as the summary
-        contactable_people_df = people_df.copy()
-        phone_column = None
-
-        for phone_col in ['phone', 'phone_number', 'mobile', 'cell']:
-            if phone_col in people_df.columns:
-                phone_column = phone_col
-                break
-
-        if phone_column:
-            contactable_people_df = people_df[
-                people_df[phone_column].notna() &
-                (people_df[phone_column] != '') &
-                (people_df[phone_column].astype(str).str.strip() != '')
-            ]
-
-            # Also exclude landline and fixed VoIP numbers that can't receive SMS
-            if 'phone_number_type' in people_df.columns:
-                contactable_people_df = contactable_people_df[
-                    ~contactable_people_df['phone_number_type'].isin(['landline', 'fixedVoip'])
-                ]
+        # Reuse the textable_people_ids calculated earlier for consistency
+        contactable_people_df = people_with_phones
 
         all_contactable = set(contactable_people_df['id'].tolist())
-        responders = set(messages_df[messages_df['direction'] == 'incoming']['person_id'].unique())
-        non_responders = all_contactable - responders
+        # Use textable_responders calculated earlier for consistency
+        non_responders = all_contactable - textable_responders
 
         st.info(f"Found {len(non_responders)} people with textable numbers who did not respond to the broadcast")
 
