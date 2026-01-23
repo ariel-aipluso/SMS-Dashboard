@@ -22,11 +22,186 @@ st.sidebar.header("📂 Data Upload")
 messages_file = st.sidebar.file_uploader("Upload Messages CSV", type=['csv'])
 people_file = st.sidebar.file_uploader("Upload People CSV", type=['csv'])
 
+def normalize_phone(phone):
+    """Normalize phone number for comparison - handles floats, +1, formatting."""
+    if pd.isna(phone):
+        return None
+    s = str(phone)
+    # Remove .0 suffix from float conversion
+    if s.endswith('.0'):
+        s = s[:-2]
+    # Remove all formatting
+    s = s.replace('+', '').replace('-', '').replace(' ', '').replace('(', '').replace(')', '')
+    # Normalize to 10 digits (remove leading 1 for US numbers)
+    if len(s) == 11 and s.startswith('1'):
+        s = s[1:]
+    return s
+
+def get_person_name(person_id, people_df):
+    """Get display name for a person, checking first_name/last_name before name column."""
+    person_row = people_df[people_df['id'] == person_id]
+    if not person_row.empty:
+        # Helper to check if value is valid (not NaN and not string 'nan')
+        def is_valid(val):
+            return pd.notna(val) and str(val).lower() != 'nan' and str(val).strip() != ''
+
+        # Try first_name/last_name first (more specific)
+        if 'first_name' in people_df.columns or 'last_name' in people_df.columns:
+            first_name = person_row['first_name'].iloc[0] if 'first_name' in people_df.columns else None
+            last_name = person_row['last_name'].iloc[0] if 'last_name' in people_df.columns else None
+            parts = []
+            if is_valid(first_name):
+                parts.append(str(first_name))
+            if is_valid(last_name):
+                parts.append(str(last_name))
+            if parts:
+                return ' '.join(parts)
+        # Fall back to name column
+        if 'name' in people_df.columns:
+            name_val = person_row['name'].iloc[0]
+            if is_valid(name_val):
+                return str(name_val)
+    return None
+
 if messages_file and people_file:
     # Load data
     try:
         messages_df = pd.read_csv(messages_file)
         people_df = pd.read_csv(people_file)
+
+        # Handle different message CSV formats
+        if 'conversation_id' in messages_df.columns and 'from' in messages_df.columns:
+            # Alternative format: conversation_id with from/to columns
+            st.info("🔄 Detected alternative message format - converting to standard format...")
+
+            # Extract recipient phone numbers and create phone-to-person mapping
+            recipient_phones = set()
+            phone_to_conversation = {}
+            conversation_ids = set()
+
+            for _, row in messages_df.iterrows():
+                if row['direction'] == 'outgoing':
+                    # For outgoing messages, recipient is in 'to' field
+                    recipient_phone = row['to']
+                else:
+                    # For incoming messages, sender is in 'from' field (but they're the recipient of the campaign)
+                    recipient_phone = row['from']
+
+                recipient_phones.add(recipient_phone)
+                phone_to_conversation[recipient_phone] = row['conversation_id']
+                conversation_ids.add(row['conversation_id'])
+
+            # Try to reconcile with existing people data
+            conversation_to_person_id = {}
+            phone_to_person_id = {}
+            matched_by_id = 0
+            matched_by_phone = 0
+
+            if not people_df.empty and 'id' in people_df.columns:
+                # First, try direct ID matching: conversation_id -> people.id
+                people_ids = set(people_df['id'].astype(str).tolist())
+                for conv_id in conversation_ids:
+                    conv_id_str = str(conv_id)
+                    if conv_id_str in people_ids:
+                        conversation_to_person_id[conv_id] = conv_id
+                        matched_by_id += 1
+
+                if matched_by_id > 0:
+                    st.success(f"🔗 Matched {matched_by_id} conversation IDs directly to people records")
+
+                # For unmatched conversations, try phone number matching
+                unmatched_conversations = conversation_ids - set(conversation_to_person_id.keys())
+
+                if unmatched_conversations:
+                    # Find phone column in people data
+                    phone_column = None
+                    for col in ['phone', 'phone_number', 'mobile', 'cell']:
+                        if col in people_df.columns:
+                            phone_column = col
+                            break
+
+                    if phone_column:
+                        # Build a lookup from normalized phone -> person ID
+                        people_phone_lookup = {}
+                        for _, person in people_df.iterrows():
+                            person_phone = person[phone_column]
+                            normalized = normalize_phone(person_phone)
+                            if normalized:
+                                people_phone_lookup[normalized] = person['id']
+
+                        # Match recipient phones to people
+                        for recipient_phone in recipient_phones:
+                            normalized_recipient = normalize_phone(recipient_phone)
+                            if normalized_recipient and normalized_recipient in people_phone_lookup:
+                                phone_to_person_id[recipient_phone] = people_phone_lookup[normalized_recipient]
+                                matched_by_phone += 1
+
+                        if matched_by_phone > 0:
+                            st.success(f"🔗 Matched {matched_by_phone} additional records by phone number")
+
+            # Create person_id mapping for messages
+            def get_person_id_for_row(row):
+                conv_id = row['conversation_id']
+                phone = row['to'] if row['direction'] == 'outgoing' else row['from']
+
+                # First try conversation_id direct match
+                if conv_id in conversation_to_person_id:
+                    return conversation_to_person_id[conv_id]
+                # Then try phone match
+                if phone in phone_to_person_id:
+                    return phone_to_person_id[phone]
+                # Fall back to conversation_id as person_id
+                return conv_id
+
+            # Add person_id to messages based on reconciliation
+            messages_df['person_id'] = messages_df.apply(get_person_id_for_row, axis=1)
+
+            # Determine which conversation_ids need synthetic people records
+            all_matched_conv_ids = set(conversation_to_person_id.keys())
+            # Also add conversation IDs that were matched via phone
+            for phone, person_id in phone_to_person_id.items():
+                conv_id = phone_to_conversation.get(phone)
+                if conv_id:
+                    all_matched_conv_ids.add(conv_id)
+
+            unmatched_conv_ids = conversation_ids - all_matched_conv_ids
+
+            if unmatched_conv_ids:
+                if people_df.empty:
+                    st.warning("📱 Creating synthetic people records from phone numbers in messages...")
+                    synthetic_people = []
+                    for conv_id in sorted(unmatched_conv_ids, key=str):
+                        # Find a phone for this conversation
+                        phone = next((p for p, c in phone_to_conversation.items() if c == conv_id), None)
+                        synthetic_people.append({
+                            'id': conv_id,
+                            'phone': phone,
+                            'name': f"Contact {str(phone)[-4:]}" if phone else f"Contact {str(conv_id)[-4:]}",
+                            'phone_number_type': messages_df[
+                                messages_df['conversation_id'] == conv_id
+                            ]['phone_number_type'].iloc[0] if 'phone_number_type' in messages_df.columns else 'mobile'
+                        })
+                    people_df = pd.DataFrame(synthetic_people)
+                else:
+                    st.info(f"📱 Adding {len(unmatched_conv_ids)} missing people records from messages...")
+                    # Add missing people to existing dataframe
+                    new_people = []
+                    for conv_id in unmatched_conv_ids:
+                        # Find a phone for this conversation
+                        phone = next((p for p, c in phone_to_conversation.items() if c == conv_id), None)
+                        new_people.append({
+                            'id': conv_id,
+                            'phone': phone,
+                            'name': f"Contact {str(phone)[-4:]}" if phone else f"Contact {str(conv_id)[-4:]}",
+                            'phone_number_type': messages_df[
+                                messages_df['conversation_id'] == conv_id
+                            ]['phone_number_type'].iloc[0] if 'phone_number_type' in messages_df.columns else 'mobile'
+                        })
+
+                    # Add missing people to existing people_df
+                    if new_people:
+                        new_people_df = pd.DataFrame(new_people)
+                        people_df = pd.concat([people_df, new_people_df], ignore_index=True)
 
         # Convert datetime columns
         if 'created_at' in messages_df.columns:
@@ -268,18 +443,8 @@ if messages_file and people_file:
 
                         # Add person names to the summary
                         def get_person_name_for_table(person_id):
-                            if 'name' in people_df.columns:
-                                person_row = people_df[people_df['id'] == person_id]
-                                if not person_row.empty and pd.notna(person_row['name'].iloc[0]):
-                                    return person_row['name'].iloc[0]
-                            elif 'first_name' in people_df.columns or 'last_name' in people_df.columns:
-                                person_row = people_df[people_df['id'] == person_id]
-                                if not person_row.empty:
-                                    first_name = person_row.get('first_name', pd.Series([None])).iloc[0] if 'first_name' in people_df.columns else ""
-                                    last_name = person_row.get('last_name', pd.Series([None])).iloc[0] if 'last_name' in people_df.columns else ""
-                                    if pd.notna(first_name) or pd.notna(last_name):
-                                        return f"{first_name or ''} {last_name or ''}".strip()
-                            return f"Person {person_id}"
+                            name = get_person_name(person_id, people_df)
+                            return name if name else f"Person {person_id}"
 
                         opt_out_summary['person_name'] = opt_out_summary['person_id'].apply(get_person_name_for_table)
                         opt_out_summary['hours_rounded'] = opt_out_summary['hours_elapsed'].round(1)
@@ -307,20 +472,8 @@ if messages_file and people_file:
                         seen_people.add(msg['person_id'])
 
                         # Get person name
-                        person_name = "Unknown"
-                        if 'name' in people_df.columns:
-                            person_row = people_df[people_df['id'] == msg['person_id']]
-                            if not person_row.empty and pd.notna(person_row['name'].iloc[0]):
-                                person_name = person_row['name'].iloc[0]
-                        elif 'first_name' in people_df.columns or 'last_name' in people_df.columns:
-                            person_row = people_df[people_df['id'] == msg['person_id']]
-                            if not person_row.empty:
-                                first_name = person_row.get('first_name', pd.Series([None])).iloc[0] if 'first_name' in people_df.columns else ""
-                                last_name = person_row.get('last_name', pd.Series([None])).iloc[0] if 'last_name' in people_df.columns else ""
-                                if pd.notna(first_name) or pd.notna(last_name):
-                                    person_name = f"{first_name or ''} {last_name or ''}".strip()
-
-                        if person_name == "Unknown" or person_name == "":
+                        person_name = get_person_name(msg['person_id'], people_df)
+                        if not person_name:
                             person_name = f"Person {msg['person_id']}"
 
                         committed_people.append({
@@ -376,20 +529,8 @@ if messages_file and people_file:
                         seen_people.add(msg['person_id'])
 
                         # Get person name
-                        person_name = "Unknown"
-                        if 'name' in people_df.columns:
-                            person_row = people_df[people_df['id'] == msg['person_id']]
-                            if not person_row.empty and pd.notna(person_row['name'].iloc[0]):
-                                person_name = person_row['name'].iloc[0]
-                        elif 'first_name' in people_df.columns or 'last_name' in people_df.columns:
-                            person_row = people_df[people_df['id'] == msg['person_id']]
-                            if not person_row.empty:
-                                first_name = person_row.get('first_name', pd.Series([None])).iloc[0] if 'first_name' in people_df.columns else ""
-                                last_name = person_row.get('last_name', pd.Series([None])).iloc[0] if 'last_name' in people_df.columns else ""
-                                if pd.notna(first_name) or pd.notna(last_name):
-                                    person_name = f"{first_name or ''} {last_name or ''}".strip()
-
-                        if person_name == "Unknown" or person_name == "":
+                        person_name = get_person_name(msg['person_id'], people_df)
+                        if not person_name:
                             person_name = f"Person {msg['person_id']}"
 
                         multiplier_people.append({
@@ -569,18 +710,9 @@ if messages_file and people_file:
         if len(responder_ids) > 0:
             # Create a mapping of person_id to name if available
             def get_display_name(person_id):
-                if 'name' in people_df.columns:
-                    person_row = people_df[people_df['id'] == person_id]
-                    if not person_row.empty and pd.notna(person_row['name'].iloc[0]):
-                        return f"{person_row['name'].iloc[0]} (ID: {person_id})"
-                elif 'first_name' in people_df.columns or 'last_name' in people_df.columns:
-                    person_row = people_df[people_df['id'] == person_id]
-                    if not person_row.empty:
-                        first_name = person_row.get('first_name', pd.Series([None])).iloc[0] if 'first_name' in people_df.columns else ""
-                        last_name = person_row.get('last_name', pd.Series([None])).iloc[0] if 'last_name' in people_df.columns else ""
-                        if pd.notna(first_name) or pd.notna(last_name):
-                            full_name = f"{first_name or ''} {last_name or ''}".strip()
-                            return f"{full_name} (ID: {person_id})"
+                name = get_person_name(person_id, people_df)
+                if name:
+                    return f"{name} (ID: {person_id})"
                 return f"Person {person_id}"
 
             selected_responder = st.selectbox(
@@ -606,7 +738,9 @@ if messages_file and people_file:
                         st.write(msg['body'])
 
     except Exception as e:
+        import traceback
         st.error(f"Error loading data: {str(e)}")
+        st.code(traceback.format_exc())
         st.info("Please ensure your CSV files have the expected column structure.")
 
 else:
@@ -614,14 +748,28 @@ else:
 
     with st.expander("Expected CSV Structure"):
         st.markdown("""
-        **Messages CSV should contain:**
+        **Messages CSV should contain (Standard Format):**
         - person_id
         - body (message content)
         - direction (incoming/outgoing)
         - created_at or sent_at (timestamp)
 
+        **Alternative Messages CSV Format:**
+        - conversation_id
+        - from (sender phone number)
+        - to (recipient phone number)
+        - body (message content)
+        - direction (incoming/outgoing)
+        - created_at (timestamp)
+        - phone_number_type (optional)
+
         **People CSV should contain:**
         - id (person identifier)
-        - opted_out (boolean)
+        - phone/phone_number/mobile/cell (phone number)
+        - name or first_name/last_name (optional)
+        - phone_number_type (optional)
+        - opted_out (boolean, optional)
         - tags (optional, comma-separated)
+
+        *Note: If using alternative message format, people records can be auto-generated from phone numbers.*
         """)
