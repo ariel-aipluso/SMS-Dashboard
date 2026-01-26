@@ -1061,7 +1061,7 @@ if messages_file and people_file:
             llm_unknown_count = 0
             committed_people = []
 
-            if use_llm_detection and llm_provider and api_key and keyword_committed_people:
+            if use_llm_detection and llm_provider and llm_api_key and keyword_committed_people:
                 # Build conversations for keyword-flagged people
                 commitment_conversations = {}
                 for person in keyword_committed_people:
@@ -1071,9 +1071,9 @@ if messages_file and people_file:
                 provider_name = "Claude" if llm_provider == "anthropic" else "GPT-4o-mini"
                 with st.spinner(f"Verifying {len(commitment_conversations)} potential commitments with {provider_name}..."):
                     if llm_provider == "anthropic":
-                        llm_results = analyze_commitments_with_anthropic(commitment_conversations, api_key, commitment_prompt_template)
+                        llm_results = analyze_commitments_with_anthropic(commitment_conversations, llm_api_key, commitment_prompt_template)
                     else:
-                        llm_results = analyze_commitments_with_openai(commitment_conversations, api_key, commitment_prompt_template)
+                        llm_results = analyze_commitments_with_openai(commitment_conversations, llm_api_key, commitment_prompt_template)
 
                 # Process LLM results
                 for person in keyword_committed_people:
@@ -1139,7 +1139,7 @@ if messages_file and people_file:
                     col_names = ['Person', 'Commitment Date', 'Message']
 
                     # Add detection method if LLM was used
-                    if use_llm_detection and llm_provider and api_key:
+                    if use_llm_detection and llm_provider and llm_api_key:
                         display_cols.insert(2, 'detection_method')
                         col_names.insert(2, 'Verified By')
 
