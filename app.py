@@ -155,29 +155,18 @@ CONVERSATION:
 
 Reply with ONLY one word: YES or NO"""
 
-# Cache disabled temporarily for debugging
 def analyze_conversations_with_anthropic(conversations: dict, api_key: str, custom_prompt: str = None) -> dict:
     """
     Use Claude to analyze conversations INDIVIDUALLY and detect opt-outs.
     """
-    st.write(f"**Debug:** analyze_conversations_with_anthropic called with {len(conversations)} conversations")
-    st.write(f"**Debug:** ANTHROPIC_AVAILABLE={ANTHROPIC_AVAILABLE}, api_key={'SET' if api_key else 'EMPTY'}")
-
     if not ANTHROPIC_AVAILABLE or not api_key:
-        st.write("**Debug:** Returning early - anthropic not available or no API key")
         return {}
 
     client = anthropic.Anthropic(api_key=api_key)
     results = {}
 
-    # Initialize debug storage - store detailed info for each call
-    st.session_state.debug_llm_calls = []
-    st.write(f"**Debug:** Starting to process {len(conversations)} conversations...")
-
-    # Use custom prompt or default
     prompt_template = custom_prompt if custom_prompt else DEFAULT_OPTOUT_PROMPT
 
-    # Process each conversation individually for accuracy
     for person_id, conversation in conversations.items():
         prompt = prompt_template.format(conversation=conversation)
 
@@ -189,32 +178,14 @@ def analyze_conversations_with_anthropic(conversations: dict, api_key: str, cust
             )
             response_text = response.content[0].text.strip().upper()
             opted_out = response_text.startswith("YES")
-
-            st.write(f"**Debug API Response:** Person {person_id} -> `{response_text}` -> opted_out={opted_out}")
-
-            # Store detailed debug info
-            st.session_state.debug_llm_calls.append({
-                'person_id': person_id,
-                'conversation': conversation,
-                'raw_response': response_text,
-                'opted_out': opted_out
-            })
-
             results[person_id] = {"opted_out": opted_out, "opt_out_message": None}
 
         except Exception as e:
             st.warning(f"Anthropic API error for {person_id}: {e}")
-            st.session_state.debug_llm_calls.append({
-                'person_id': person_id,
-                'conversation': conversation,
-                'raw_response': f"ERROR: {e}",
-                'opted_out': "unknown"
-            })
             results[person_id] = {"opted_out": "unknown", "opt_out_message": None, "error": str(e)}
 
     return results
 
-# Cache disabled temporarily for debugging
 def analyze_conversations_with_openai(conversations: dict, api_key: str, custom_prompt: str = None) -> dict:
     """
     Use OpenAI to analyze conversations INDIVIDUALLY and detect opt-outs.
@@ -258,13 +229,6 @@ def analyze_commitments_with_anthropic(conversations: dict, api_key: str, custom
 
     client = anthropic.Anthropic(api_key=api_key)
     results = {}
-
-    # Initialize debug storage
-    if 'debug_commitment_calls' not in st.session_state:
-        st.session_state.debug_commitment_calls = []
-    st.session_state.debug_commitment_calls = []
-
-    # Use custom prompt or default
     prompt_template = custom_prompt if custom_prompt else DEFAULT_COMMITMENT_PROMPT
 
     for person_id, conversation in conversations.items():
@@ -278,23 +242,9 @@ def analyze_commitments_with_anthropic(conversations: dict, api_key: str, custom
             )
             response_text = response.content[0].text.strip().upper()
             is_committed = response_text.startswith("YES")
-
-            st.session_state.debug_commitment_calls.append({
-                'person_id': person_id,
-                'conversation': conversation,
-                'raw_response': response_text,
-                'is_committed': is_committed
-            })
-
             results[person_id] = {"is_committed": is_committed}
 
         except Exception as e:
-            st.session_state.debug_commitment_calls.append({
-                'person_id': person_id,
-                'conversation': conversation,
-                'raw_response': f"ERROR: {e}",
-                'is_committed': "unknown"
-            })
             results[person_id] = {"is_committed": "unknown", "error": str(e)}
 
     return results
@@ -308,12 +258,6 @@ def analyze_commitments_with_openai(conversations: dict, api_key: str, custom_pr
 
     client = openai.OpenAI(api_key=api_key)
     results = {}
-
-    if 'debug_commitment_calls' not in st.session_state:
-        st.session_state.debug_commitment_calls = []
-    st.session_state.debug_commitment_calls = []
-
-    # Use custom prompt or default
     prompt_template = custom_prompt if custom_prompt else DEFAULT_COMMITMENT_PROMPT
 
     for person_id, conversation in conversations.items():
@@ -327,23 +271,9 @@ def analyze_commitments_with_openai(conversations: dict, api_key: str, custom_pr
             )
             response_text = response.choices[0].message.content.strip().upper()
             is_committed = response_text.startswith("YES")
-
-            st.session_state.debug_commitment_calls.append({
-                'person_id': person_id,
-                'conversation': conversation,
-                'raw_response': response_text,
-                'is_committed': is_committed
-            })
-
             results[person_id] = {"is_committed": is_committed}
 
         except Exception as e:
-            st.session_state.debug_commitment_calls.append({
-                'person_id': person_id,
-                'conversation': conversation,
-                'raw_response': f"ERROR: {e}",
-                'is_committed': "unknown"
-            })
             results[person_id] = {"is_committed": "unknown", "error": str(e)}
 
     return results
@@ -369,8 +299,6 @@ def detect_optouts(messages_df, use_llm=False, llm_provider=None, api_key=None, 
     # Get people flagged by keyword matching
     keyword_opted_out_people = set(incoming_messages[incoming_messages['is_stop_keyword']]['person_id'].unique())
 
-    st.write(f"**Debug Flow:** use_llm={use_llm}, llm_provider={llm_provider}, api_key={'SET' if api_key else 'EMPTY'}, keyword_flagged={len(keyword_opted_out_people) if keyword_opted_out_people else 0}")
-
     if use_llm and llm_provider and api_key and keyword_opted_out_people:
         # Only analyze conversations that were flagged by keywords (cost optimization)
         conversations = {}
@@ -378,7 +306,6 @@ def detect_optouts(messages_df, use_llm=False, llm_provider=None, api_key=None, 
             person_msgs = messages_df[messages_df['person_id'] == person_id].sort_values('created_at')
             conversations[person_id] = format_conversation_for_llm(person_msgs)
 
-        st.write(f"**Debug:** Built {len(conversations)} conversations to analyze")
         provider_name = "Claude" if llm_provider == "anthropic" else "GPT-4o-mini"
         with st.spinner(f"Verifying {len(conversations)} keyword-flagged conversations with {provider_name}..."):
             if llm_provider == "anthropic":
@@ -423,26 +350,6 @@ def detect_optouts(messages_df, use_llm=False, llm_provider=None, api_key=None, 
             st.info(f"🤖 AI rejected {rejected_count} false positive(s) from keyword matching")
         if unknown_count > 0:
             st.warning(f"⚠️ {unknown_count} conversation(s) could not be analyzed (API error) - kept as keyword match")
-
-        # Debug output - show detailed LLM analysis
-        with st.expander("🔍 Debug: LLM Analysis Details", expanded=True):
-            if 'debug_llm_calls' in st.session_state and st.session_state.debug_llm_calls:
-                st.write("**Each LLM call with conversation and response:**")
-                for call in st.session_state.debug_llm_calls:
-                    with st.container():
-                        if call['opted_out'] == "unknown":
-                            status = "⚠️ UNKNOWN (API error)"
-                        elif call['opted_out']:
-                            status = "✅ OPT-OUT"
-                        else:
-                            status = "❌ NOT opt-out"
-                        st.markdown(f"### Person {call['person_id']}: {status}")
-                        st.write(f"**Raw LLM Response:** `{call['raw_response']}`")
-                        st.write("**Conversation sent:**")
-                        st.code(call['conversation'])
-                        st.divider()
-            else:
-                st.write("No LLM calls recorded")
 
     # Final opt-out status
     incoming_messages['is_stop'] = incoming_messages['is_stop_keyword']
@@ -538,6 +445,47 @@ if messages_file and people_file:
     try:
         messages_df = pd.read_csv(messages_file)
         people_df = pd.read_csv(people_file)
+
+        # Parse tags early for exclusion filter
+        excluded_tags = []
+        if 'tags' in people_df.columns:
+            # Parse tags (assuming comma-separated)
+            people_df['tag_list'] = people_df['tags'].fillna('').astype(str).apply(
+                lambda x: [tag.strip() for tag in x.split(',') if tag.strip()]
+            )
+
+            # Get all unique tags
+            all_tags_set = set()
+            for tag_list in people_df['tag_list']:
+                all_tags_set.update(tag_list)
+            all_tags_list = sorted([tag for tag in all_tags_set if tag])
+
+            # Sidebar: Exclude Test Data section
+            if all_tags_list:
+                st.sidebar.markdown("---")
+                st.sidebar.header("🧪 Exclude Test Data")
+                excluded_tags = st.sidebar.multiselect(
+                    "Exclude people with these tags",
+                    all_tags_list,
+                    help="People with any of these tags will be excluded from all analytics"
+                )
+
+                if excluded_tags:
+                    # Filter out people with excluded tags
+                    def has_excluded_tag(tag_list):
+                        return any(tag in excluded_tags for tag in tag_list)
+
+                    excluded_people_mask = people_df['tag_list'].apply(has_excluded_tag)
+                    excluded_count = excluded_people_mask.sum()
+
+                    # Get IDs of excluded people before filtering
+                    excluded_people_ids = set(people_df[excluded_people_mask]['id'].tolist())
+
+                    # Filter people and messages
+                    people_df = people_df[~excluded_people_mask]
+                    messages_df = messages_df[~messages_df['person_id'].isin(excluded_people_ids)]
+
+                    st.sidebar.caption(f"Excluding {excluded_count:,} people")
 
         # Collect loading messages for collapsed display
         loading_messages = []
@@ -1099,21 +1047,6 @@ if messages_file and people_file:
                     st.info(f"🤖 AI rejected {llm_rejected_count} false positive(s) from keyword matching")
                 if llm_unknown_count > 0:
                     st.warning(f"⚠️ {llm_unknown_count} commitment(s) could not be analyzed (API error)")
-
-                # Debug output for commitments
-                with st.expander("🔍 Debug: Commitment LLM Analysis"):
-                    if 'debug_commitment_calls' in st.session_state and st.session_state.debug_commitment_calls:
-                        for call in st.session_state.debug_commitment_calls:
-                            if call['is_committed'] == "unknown":
-                                status = "⚠️ UNKNOWN (API error)"
-                            elif call['is_committed']:
-                                status = "✅ COMMITTED"
-                            else:
-                                status = "❌ NOT committed"
-                            st.markdown(f"**Person {call['person_id']}:** {status}")
-                            st.write(f"Raw Response: `{call['raw_response']}`")
-                            st.code(call['conversation'])
-                            st.divider()
             else:
                 # No LLM - use keyword results directly
                 committed_people = keyword_committed_people
