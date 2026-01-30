@@ -84,7 +84,12 @@ def is_valid_phone(phone):
 
 def get_person_name(person_id, people_df):
     """Get display name for a person, checking first_name/last_name before name column."""
+    # Handle type mismatches by trying both direct comparison and string comparison
     person_row = people_df[people_df['id'] == person_id]
+    if person_row.empty:
+        # Try string comparison as fallback for type mismatches
+        person_id_str = str(person_id)
+        person_row = people_df[people_df['id'].astype(str) == person_id_str]
     if not person_row.empty:
         # Helper to check if value is valid (not NaN and not string 'nan')
         def is_valid(val):
@@ -118,7 +123,7 @@ def format_conversation_for_llm(person_messages_df):
         lines.append(f"{direction}: {body}")
     return "\n".join(lines)
 
-PROMPT_VERSION = "v5"  # Increment this when changing the prompt to bust cache
+PROMPT_VERSION = "v7"  # Increment this when changing the prompt to bust cache
 
 # Default prompts for AI verification
 DEFAULT_OPTOUT_PROMPT = """Look at this SMS conversation. Did the person (THEM) send "STOP" to unsubscribe?
@@ -137,18 +142,17 @@ CONVERSATION:
 
 Reply with ONLY one word: YES or NO"""
 
-DEFAULT_COMMITMENT_PROMPT = """Analyze this SMS conversation. Did the person (THEM) make a genuine commitment to take action?
+DEFAULT_COMMITMENT_PROMPT = """Analyze this SMS conversation. Did the person (THEM) commit to attending an event at ANY point in the conversation?
 
-Answer YES only if THEM clearly committed to:
-- Attending an event ("I'll be there", "count me in", "I'm coming")
-- Taking a specific action ("I will do it", "I'll help", "sign me up")
-- Participating in something ("I'm in", "absolutely", "definitely joining")
+Answer YES if ANYWHERE in the conversation THEM:
+- Said "yes", "yeah", "yep", "sure", or similar when asked to attend/join an event
+- Used phrases like "I'll be there", "count me in", "I'm coming", "I'm in", "sign me up"
 
-Answer NO if:
-- They just said "yes" to acknowledge a message without committing to action
-- They're asking questions or being conversational
-- The commitment is vague or unclear
-- They said words like "yes" but in context of something else (e.g., "yes I got your message")
+Note: THEM may say "yes" multiple times for different reasons (e.g., yes to attend, yes they know someone, yes they want help). Look for ANY "yes" that was in response to an invitation to attend an event.
+
+Answer NO only if:
+- THEM never said yes to attending the event itself
+- THEM explicitly declined the invitation
 
 CONVERSATION:
 {conversation}
@@ -365,18 +369,24 @@ def detect_optouts(messages_df, use_llm=False, llm_provider=None, api_key=None, 
 # Sidebar: LLM Configuration
 st.sidebar.markdown("---")
 st.sidebar.header("🤖 AI Verification")
-use_llm_detection = False
+use_llm_optout = False
+use_llm_commitment = False
 llm_provider = None
 llm_api_key = None
 
 if ANTHROPIC_AVAILABLE or OPENAI_AVAILABLE:
-    use_llm_detection = st.sidebar.checkbox(
-        "Enable AI verification",
-        help="Uses AI to verify keyword matches and reduce false positives"
+    st.sidebar.caption("Select which features to enable:")
+    use_llm_optout = st.sidebar.checkbox(
+        "AI opt-out detection",
+        help="Uses AI to verify opt-out keyword matches"
     )
-    if use_llm_detection:
-        st.sidebar.caption("AI verification is used for:")
-        st.sidebar.markdown("• Opt-out detection\n• Commitment verification")
+    use_llm_commitment = st.sidebar.checkbox(
+        "AI commitment verification",
+        value=True,
+        help="Uses AI to detect commitments in all conversations"
+    )
+
+    if use_llm_optout or use_llm_commitment:
         st.sidebar.caption("Enter at least one API key:")
 
         anthropic_key = None
@@ -405,7 +415,14 @@ if ANTHROPIC_AVAILABLE or OPENAI_AVAILABLE:
             llm_api_key = openai_key
         else:
             st.sidebar.warning("Enter an API key to enable AI verification")
-            use_llm_detection = False
+            use_llm_optout = False
+            use_llm_commitment = False
+
+        # Auto-reset prompts when PROMPT_VERSION changes
+        if st.session_state.get('prompt_version') != PROMPT_VERSION:
+            st.session_state['custom_optout_prompt'] = DEFAULT_OPTOUT_PROMPT
+            st.session_state['custom_commitment_prompt'] = DEFAULT_COMMITMENT_PROMPT
+            st.session_state['prompt_version'] = PROMPT_VERSION
 
         # Editable prompts section
         with st.sidebar.expander("✏️ Customize AI Prompts"):
@@ -481,9 +498,16 @@ if messages_file and people_file:
                     # Get IDs of excluded people before filtering
                     excluded_people_ids = set(people_df[excluded_people_mask]['id'].tolist())
 
-                    # Filter people and messages
+                    # Filter people
                     people_df = people_df[~excluded_people_mask]
-                    messages_df = messages_df[~messages_df['person_id'].isin(excluded_people_ids)]
+
+                    # Filter messages if person_id column exists
+                    # (alternative format will have person_id added later, filter will be applied then)
+                    if 'person_id' in messages_df.columns:
+                        messages_df = messages_df[~messages_df['person_id'].isin(excluded_people_ids)]
+
+                    # Store excluded IDs for later filtering (after format conversion)
+                    st.session_state['excluded_people_ids'] = excluded_people_ids
 
                     st.sidebar.caption(f"Excluding {excluded_count:,} people")
 
@@ -630,6 +654,15 @@ if messages_file and people_file:
         if 'sent_at' in messages_df.columns:
             messages_df['sent_at'] = pd.to_datetime(messages_df['sent_at'])
 
+        # Apply tag-based exclusion filter for messages (for alternative format that now has person_id)
+        if 'excluded_people_ids' in st.session_state and st.session_state['excluded_people_ids']:
+            excluded_ids = st.session_state['excluded_people_ids']
+            # Filter by both direct ID and string comparison for type safety
+            messages_df = messages_df[
+                ~messages_df['person_id'].isin(excluded_ids) &
+                ~messages_df['person_id'].astype(str).isin([str(x) for x in excluded_ids])
+            ]
+
         loading_messages.append(("success", f"✅ Loaded {len(messages_df)} messages and {len(people_df)} people records"))
 
         # Display loading messages in collapsed expander
@@ -775,12 +808,22 @@ if messages_file and people_file:
 
         # Opt-out timing analysis
         st.header("⏰ Opt-out Timing Analysis")
-        detection_method = "AI + keyword matching" if use_llm_detection else "keyword matching"
+        detection_method = "AI + keyword matching" if use_llm_optout else "keyword matching"
         st.caption(f"Analyzing opt-outs by engagement level ({detection_method})")
 
         if 'body' in messages_df.columns:
-            # Detect opt-outs using keyword matching or LLM
-            incoming_messages = detect_optouts(messages_df, use_llm=use_llm_detection, llm_provider=llm_provider, api_key=llm_api_key, custom_prompt=optout_prompt_template)
+            # Create cache key for opt-out detection
+            optout_cache_key = f"optout_{len(messages_df)}_{use_llm_optout}_{llm_provider}_{hash(optout_prompt_template)}"
+
+            # Use cached results if available
+            if 'optout_cache_key' in st.session_state and st.session_state.get('optout_cache_key') == optout_cache_key:
+                incoming_messages = st.session_state['optout_results']
+            else:
+                # Detect opt-outs using keyword matching or LLM
+                incoming_messages = detect_optouts(messages_df, use_llm=use_llm_optout, llm_provider=llm_provider, api_key=llm_api_key, custom_prompt=optout_prompt_template)
+                st.session_state['optout_cache_key'] = optout_cache_key
+                st.session_state['optout_results'] = incoming_messages
+
             stop_messages = incoming_messages[incoming_messages['is_stop']]
             opted_out_people = stop_messages['person_id'].unique().tolist()
 
@@ -967,7 +1010,7 @@ if messages_file and people_file:
                             'stop_message': 'STOP Message'
                         }
                         # Add detection method column if LLM detection was used
-                        if use_llm_detection and 'detection_method' in opt_out_summary.columns:
+                        if use_llm_optout and 'detection_method' in opt_out_summary.columns:
                             display_cols.insert(2, 'detection_method')
                             col_config['detection_method'] = 'Detected By'
                         st.dataframe(opt_out_summary[display_cols].rename(columns=col_config))
@@ -982,78 +1025,127 @@ if messages_file and people_file:
         if 'body' in messages_df.columns:
             incoming_messages = messages_df[messages_df['direction'] == 'incoming'].copy()
 
-            # Step 1: Keyword matching to find potential commitments
-            keyword_committed_people = []
-            seen_people = set()
+            # Create cache key for commitment detection
+            commitment_cache_key = f"commit_{len(messages_df)}_{use_llm_commitment}_{llm_provider}_{hash(commitment_prompt_template)}_{len(opted_out_people_set)}"
 
-            for _, msg in incoming_messages.iterrows():
-                if any(keyword in str(msg['body']).lower() for keyword in commitment_keywords):
-                    if msg['person_id'] not in seen_people:
-                        seen_people.add(msg['person_id'])
-
-                        person_name = get_person_name(msg['person_id'], people_df)
-                        if not person_name:
-                            person_name = f"Person {msg['person_id']}"
-
-                        keyword_committed_people.append({
-                            'person_name': person_name,
-                            'person_id': msg['person_id'],
-                            'commitment_date': msg['created_at'],
-                            'raw_message': msg['body'],
-                            'detection_method': 'Keyword'
-                        })
-
-            # Step 2: LLM verification if enabled
-            llm_verified_count = 0
-            llm_rejected_count = 0
-            llm_unknown_count = 0
-            committed_people = []
-
-            if use_llm_detection and llm_provider and llm_api_key and keyword_committed_people:
-                # Build conversations for keyword-flagged people
-                commitment_conversations = {}
-                for person in keyword_committed_people:
-                    person_msgs = messages_df[messages_df['person_id'] == person['person_id']].sort_values('created_at')
-                    commitment_conversations[person['person_id']] = format_conversation_for_llm(person_msgs)
-
-                provider_name = "Claude" if llm_provider == "anthropic" else "GPT-4o-mini"
-                with st.spinner(f"Verifying {len(commitment_conversations)} potential commitments with {provider_name}..."):
-                    if llm_provider == "anthropic":
-                        llm_results = analyze_commitments_with_anthropic(commitment_conversations, llm_api_key, commitment_prompt_template)
-                    else:
-                        llm_results = analyze_commitments_with_openai(commitment_conversations, llm_api_key, commitment_prompt_template)
-
-                # Process LLM results
-                for person in keyword_committed_people:
-                    result = llm_results.get(person['person_id'], {"is_committed": "unknown"})
-                    status = result.get('is_committed')
-
-                    if status == "unknown":
-                        person['detection_method'] = 'AI Unknown'
-                        committed_people.append(person)
-                        llm_unknown_count += 1
-                    elif status:
-                        person['detection_method'] = 'AI Verified'
-                        committed_people.append(person)
-                        llm_verified_count += 1
-                    else:
-                        # LLM rejected - don't include in final list
-                        llm_rejected_count += 1
-
-                # Show LLM verification results
-                if llm_verified_count > 0:
-                    st.success(f"🤖 AI verified {llm_verified_count} commitment(s)")
-                if llm_rejected_count > 0:
-                    st.info(f"🤖 AI rejected {llm_rejected_count} false positive(s) from keyword matching")
-                if llm_unknown_count > 0:
-                    st.warning(f"⚠️ {llm_unknown_count} commitment(s) could not be analyzed (API error)")
+            # Check if we have cached results
+            if 'commitment_cache_key' in st.session_state and st.session_state.get('commitment_cache_key') == commitment_cache_key:
+                committed_people = st.session_state['committed_people']
+                rejected_people = st.session_state['rejected_people']
+                llm_verified_count = st.session_state.get('llm_verified_count', 0)
+                llm_rejected_count = st.session_state.get('llm_rejected_count', 0)
+                llm_unknown_count = st.session_state.get('llm_unknown_count', 0)
             else:
-                # No LLM - use keyword results directly
-                committed_people = keyword_committed_people
+                llm_verified_count = 0
+                llm_rejected_count = 0
+                llm_unknown_count = 0
+                committed_people = []
+                rejected_people = []
 
-            if committed_people:
+                if use_llm_commitment and llm_provider and llm_api_key:
+                    # AI mode: Analyze ALL non-opted-out responders
+                    # Get all unique responders who haven't opted out
+                    all_responder_ids = set(incoming_messages['person_id'].unique())
+                    non_opted_out_responders = all_responder_ids - opted_out_people_set
+
+                    if non_opted_out_responders:
+                        # Build conversations for all non-opted-out responders
+                        commitment_conversations = {}
+                        responder_info = {}  # Store info for building results
+
+                        for person_id in non_opted_out_responders:
+                            person_msgs = messages_df[messages_df['person_id'] == person_id].sort_values('created_at')
+                            commitment_conversations[person_id] = format_conversation_for_llm(person_msgs)
+
+                            # Get first incoming message for date/message info
+                            first_incoming = incoming_messages[incoming_messages['person_id'] == person_id].iloc[0]
+                            person_name = get_person_name(person_id, people_df)
+                            if not person_name:
+                                person_name = f"Person {person_id}"
+
+                            responder_info[person_id] = {
+                                'person_name': person_name,
+                                'person_id': person_id,
+                                'commitment_date': first_incoming['created_at'],
+                                'raw_message': first_incoming['body']
+                            }
+
+                        provider_name = "Claude" if llm_provider == "anthropic" else "GPT-4o-mini"
+                        with st.spinner(f"Analyzing {len(commitment_conversations)} conversations with {provider_name}..."):
+                            if llm_provider == "anthropic":
+                                llm_results = analyze_commitments_with_anthropic(commitment_conversations, llm_api_key, commitment_prompt_template)
+                            else:
+                                llm_results = analyze_commitments_with_openai(commitment_conversations, llm_api_key, commitment_prompt_template)
+
+                        # Process LLM results
+                        for person_id, info in responder_info.items():
+                            result = llm_results.get(person_id, {"is_committed": "unknown"})
+                            status = result.get('is_committed')
+
+                            person_data = info.copy()
+
+                            if status == "unknown":
+                                person_data['detection_method'] = 'AI Unknown'
+                                committed_people.append(person_data)
+                                llm_unknown_count += 1
+                            elif status:
+                                person_data['detection_method'] = 'AI Verified'
+                                committed_people.append(person_data)
+                                llm_verified_count += 1
+                            else:
+                                person_data['detection_method'] = 'AI Rejected'
+                                rejected_people.append(person_data)
+                                llm_rejected_count += 1
+
+                else:
+                    # No LLM - use keyword matching
+                    keyword_committed_people = []
+                    seen_people = set()
+
+                    for _, msg in incoming_messages.iterrows():
+                        if any(keyword in str(msg['body']).lower() for keyword in commitment_keywords):
+                            if msg['person_id'] not in seen_people:
+                                seen_people.add(msg['person_id'])
+
+                                person_name = get_person_name(msg['person_id'], people_df)
+                                if not person_name:
+                                    person_name = f"Person {msg['person_id']}"
+
+                                keyword_committed_people.append({
+                                    'person_name': person_name,
+                                    'person_id': msg['person_id'],
+                                    'commitment_date': msg['created_at'],
+                                    'raw_message': msg['body'],
+                                    'detection_method': 'Keyword'
+                                })
+
+                    committed_people = keyword_committed_people
+
+                # Cache the results
+                st.session_state['commitment_cache_key'] = commitment_cache_key
+                st.session_state['committed_people'] = committed_people
+                st.session_state['rejected_people'] = rejected_people
+                st.session_state['llm_verified_count'] = llm_verified_count
+                st.session_state['llm_rejected_count'] = llm_rejected_count
+                st.session_state['llm_unknown_count'] = llm_unknown_count
+
+            # Show LLM results (whether cached or fresh)
+            if use_llm_commitment and llm_provider and llm_api_key:
+                if llm_verified_count > 0:
+                    st.success(f"🤖 AI detected {llm_verified_count} commitment(s)")
+                if llm_rejected_count > 0:
+                    st.info(f"🤖 AI found {llm_rejected_count} responder(s) with unclear commitments")
+                if llm_unknown_count > 0:
+                    st.warning(f"⚠️ {llm_unknown_count} conversation(s) could not be analyzed (API error)")
+
+            if committed_people or rejected_people:
                 # Summary stats
-                col1, col2 = st.columns(2)
+                if rejected_people:
+                    col1, col2, col3 = st.columns(3)
+                else:
+                    col1, col2 = st.columns(2)
+                    col3 = None
+
                 with col1:
                     total_committed = len(committed_people)
                     st.metric("Committed Responders", f"{total_committed}")
@@ -1062,21 +1154,27 @@ if messages_file and people_file:
                         commitment_rate = (total_committed / active_responders * 100) if active_responders > 0 else 0
                         st.metric("Commitment Rate", f"{commitment_rate:.1f}%")
                         st.caption("% of active responders who committed to action")
+                if col3:
+                    with col3:
+                        st.metric("AI Rejected (False Positives)", f"{len(rejected_people)}")
+                        st.caption("Keyword matches that AI determined weren't commitments")
 
-                # Collapsible table section
-                with st.expander(f"View {len(committed_people)} Committed Responder Details"):
-                    committed_df = pd.DataFrame(committed_people)
-                    committed_df['commitment_date_formatted'] = committed_df['commitment_date'].dt.strftime('%Y-%m-%d %H:%M')
+                # Collapsible table section - include both committed and rejected
+                all_people = committed_people + rejected_people
+                expander_label = f"View {len(committed_people)} Committed" + (f" + {len(rejected_people)} AI-Rejected" if rejected_people else "") + " Details"
+                with st.expander(expander_label):
+                    all_df = pd.DataFrame(all_people)
+                    all_df['commitment_date_formatted'] = all_df['commitment_date'].dt.strftime('%Y-%m-%d %H:%M')
 
                     display_cols = ['person_name', 'commitment_date_formatted', 'raw_message']
-                    col_names = ['Person', 'Commitment Date', 'Message']
+                    col_names = ['Person', 'Date', 'Message']
 
                     # Add detection method if LLM was used
-                    if use_llm_detection and llm_provider and llm_api_key:
+                    if use_llm_commitment and llm_provider and llm_api_key:
                         display_cols.insert(2, 'detection_method')
-                        col_names.insert(2, 'Verified By')
+                        col_names.insert(2, 'Status')
 
-                    display_df = committed_df[display_cols].copy()
+                    display_df = all_df[display_cols].copy()
                     display_df.columns = col_names
 
                     st.dataframe(display_df, use_container_width=True)
@@ -1213,7 +1311,10 @@ if messages_file and people_file:
                 non_responder_data = []
 
                 for person_id in non_responders:
+                    # Handle type mismatches with string comparison fallback
                     person_row = people_df[people_df['id'] == person_id]
+                    if person_row.empty:
+                        person_row = people_df[people_df['id'].astype(str) == str(person_id)]
                     if not person_row.empty:
                         person = person_row.iloc[0]
 
