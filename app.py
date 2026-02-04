@@ -22,6 +22,27 @@ try:
 except ImportError:
     OPENAI_AVAILABLE = False
 
+
+def get_centralized_api_key(provider: str) -> str | None:
+    """Get centralized API key from secrets or environment variables.
+
+    Resolution order:
+    1. Streamlit secrets (`.streamlit/secrets.toml`)
+    2. Environment variable (ANTHROPIC_API_KEY or OPENAI_API_KEY)
+    """
+    env_var = f"{provider.upper()}_API_KEY"
+
+    # Try environment variable first (works in deployment)
+    if os.getenv(env_var):
+        return os.getenv(env_var)
+
+    # Try Streamlit secrets (local development)
+    try:
+        return st.secrets.get("api_keys", {}).get(provider.lower())
+    except Exception:
+        return None
+
+
 st.set_page_config(
     page_title="SMS Campaign Analytics",
     page_icon="📱",
@@ -366,6 +387,29 @@ def detect_optouts(messages_df, use_llm=False, llm_provider=None, api_key=None, 
 
     return incoming_messages
 
+# Sidebar: Date Filter (available before data upload)
+st.sidebar.markdown("---")
+st.sidebar.header("📅 Date Filter")
+
+date_filter_type = st.sidebar.radio(
+    "Filter conversations by date",
+    ["All dates", "Before date", "After date", "Date range"],
+    horizontal=False,
+    key="date_filter_type"
+)
+
+# Store date filter values in session state (will be applied after data loads)
+if date_filter_type == "Before date":
+    filter_before_date = st.sidebar.date_input("Show conversations before", value=None, key="filter_before_date")
+elif date_filter_type == "After date":
+    filter_after_date = st.sidebar.date_input("Show conversations after", value=None, key="filter_after_date")
+elif date_filter_type == "Date range":
+    range_col1, range_col2 = st.sidebar.columns(2)
+    with range_col1:
+        filter_start_date = st.date_input("From", value=None, key="filter_start_date")
+    with range_col2:
+        filter_end_date = st.date_input("To", value=None, key="filter_end_date")
+
 # Sidebar: LLM Configuration
 st.sidebar.markdown("---")
 st.sidebar.header("🤖 AI Verification")
@@ -382,31 +426,48 @@ if ANTHROPIC_AVAILABLE or OPENAI_AVAILABLE:
     )
     use_llm_commitment = st.sidebar.checkbox(
         "AI commitment verification",
-        value=True,
+        value=False,
         help="Uses AI to detect commitments in all conversations"
     )
 
     if use_llm_optout or use_llm_commitment:
-        st.sidebar.caption("Enter at least one API key:")
+        # Check for centralized API keys
+        centralized_anthropic = get_centralized_api_key("anthropic") if ANTHROPIC_AVAILABLE else None
+        centralized_openai = get_centralized_api_key("openai") if OPENAI_AVAILABLE else None
 
-        anthropic_key = None
-        openai_key = None
+        # Determine if we have a centralized key available
+        has_centralized_key = bool(centralized_anthropic or centralized_openai)
 
-        if ANTHROPIC_AVAILABLE:
-            anthropic_key = st.sidebar.text_input(
-                "Anthropic API Key",
-                type="password",
-                help="From console.anthropic.com (uses Claude Haiku)"
-            )
+        if has_centralized_key:
+            st.sidebar.success("AI features enabled")
+        else:
+            st.sidebar.caption("Enter an API key to enable AI:")
 
-        if OPENAI_AVAILABLE:
-            openai_key = st.sidebar.text_input(
-                "OpenAI API Key",
-                type="password",
-                help="From platform.openai.com (uses GPT-4o-mini)"
-            )
+        # Optional override section
+        with st.sidebar.expander("Use your own API key (optional)"):
+            st.caption("Override the default with your own key")
+            anthropic_key_override = None
+            openai_key_override = None
 
-        # Use whichever key is provided (prefer Anthropic if both)
+            if ANTHROPIC_AVAILABLE:
+                anthropic_key_override = st.text_input(
+                    "Anthropic API Key",
+                    type="password",
+                    help="From console.anthropic.com (uses Claude Haiku)"
+                )
+
+            if OPENAI_AVAILABLE:
+                openai_key_override = st.text_input(
+                    "OpenAI API Key",
+                    type="password",
+                    help="From platform.openai.com (uses GPT-4o-mini)"
+                )
+
+        # Resolve final API key: user override > centralized
+        anthropic_key = anthropic_key_override or centralized_anthropic
+        openai_key = openai_key_override or centralized_openai
+
+        # Use whichever key is available (prefer Anthropic if both)
         if anthropic_key:
             llm_provider = "anthropic"
             llm_api_key = anthropic_key
@@ -510,6 +571,31 @@ if messages_file and people_file:
                     st.session_state['excluded_people_ids'] = excluded_people_ids
 
                     st.sidebar.caption(f"Excluding {excluded_count:,} people")
+
+        # Apply date filter from sidebar settings
+        date_col = 'created_at' if 'created_at' in messages_df.columns else 'sent_at' if 'sent_at' in messages_df.columns else None
+
+        if date_col and date_filter_type != "All dates":
+            # Ensure date column is datetime
+            messages_df[date_col] = pd.to_datetime(messages_df[date_col], errors='coerce')
+            original_count = len(messages_df)
+
+            if date_filter_type == "Before date" and st.session_state.get('filter_before_date'):
+                filter_date = st.session_state['filter_before_date']
+                messages_df = messages_df[messages_df[date_col].dt.date < filter_date]
+
+            elif date_filter_type == "After date" and st.session_state.get('filter_after_date'):
+                filter_date = st.session_state['filter_after_date']
+                messages_df = messages_df[messages_df[date_col].dt.date > filter_date]
+
+            elif date_filter_type == "Date range":
+                start_date = st.session_state.get('filter_start_date')
+                end_date = st.session_state.get('filter_end_date')
+                if start_date and end_date:
+                    messages_df = messages_df[(messages_df[date_col].dt.date >= start_date) & (messages_df[date_col].dt.date <= end_date)]
+
+            if len(messages_df) != original_count:
+                st.info(f"📅 Date filter applied: showing {len(messages_df):,} of {original_count:,} messages")
 
         # Collect loading messages for collapsed display
         loading_messages = []
@@ -767,6 +853,7 @@ if messages_file and people_file:
 
         # Engagement depth analysis
         st.header("📈 Engagement Depth Analysis")
+        st.caption("Analyzes message counts from active responders (excludes opted-out users)")
 
         # Calculate response counts per person (exclude opt-outs from engagement analysis)
         engaged_messages = messages_df[
@@ -1289,91 +1376,191 @@ if messages_file and people_file:
                     comparison_df = comparison_df.round(2)
                     st.dataframe(comparison_df)
 
-        # Non-responder export
-        st.header("📤 Export Non-Responders")
+        # CSV Export section
+        st.header("📤 Export as CSV")
 
-        # Calculate non-responders (only from contactable people)
-        # Reuse the textable_people_ids calculated earlier for consistency
-        contactable_people_df = people_with_phones
+        # Calculate sets for filtering
+        all_responder_ids_export = set(messages_df[messages_df['direction'] == 'incoming']['person_id'].unique())
+        all_contactable_export = set(people_with_phones['id'].tolist())
+        non_responder_ids_export = all_contactable_export - all_responder_ids_export
+        committed_ids_export = set()
+        if 'committed_people' in st.session_state and st.session_state['committed_people']:
+            committed_ids_export = {p['person_id'] for p in st.session_state['committed_people']}
 
-        all_contactable = set(contactable_people_df['id'].tolist())
-        # Use textable_responders calculated earlier for consistency
-        non_responders = all_contactable - textable_responders
+        # Filter and export type selection
+        export_col1, export_col2 = st.columns(2)
+        with export_col1:
+            export_filter = st.selectbox(
+                "Filter by",
+                ["All Responders", "Opted Out", "Active (Not Opted Out)", "Committed", "Non-Responders"],
+                key="export_filter"
+            )
+        with export_col2:
+            export_type = st.selectbox(
+                "Export type",
+                ["Responder Details", "Full Conversation"],
+                key="export_type"
+            )
 
-        st.info(f"Found {len(non_responders)} people with textable numbers who did not respond to the broadcast")
+        # Apply filter
+        if export_filter == "All Responders":
+            export_ids = list(all_responder_ids_export)
+            filter_label = "all_responders"
+        elif export_filter == "Opted Out":
+            export_ids = list(all_responder_ids_export & opted_out_people_set)
+            filter_label = "opted_out"
+        elif export_filter == "Active (Not Opted Out)":
+            export_ids = list(all_responder_ids_export - opted_out_people_set)
+            filter_label = "active"
+        elif export_filter == "Committed":
+            export_ids = list(committed_ids_export)
+            filter_label = "committed"
+        else:  # Non-Responders
+            export_ids = list(non_responder_ids_export)
+            filter_label = "non_responders"
 
-        if len(non_responders) > 0:
+        st.info(f"Found {len(export_ids)} people matching filter: {export_filter}")
+
+        if len(export_ids) > 0:
             # Tag input
-            export_tag = st.text_input("Tag for exported non-responders:", value="no_response_v1")
+            export_tag = st.text_input("Tag for export:", value=f"{filter_label}_v1", key="export_tag")
 
-            if st.button("📥 Export Non-Responders as CSV"):
-                # Create export dataframe
-                non_responder_data = []
+            if st.button("📥 Generate CSV Export"):
+                export_data = []
 
-                for person_id in non_responders:
+                for person_id in export_ids:
                     # Handle type mismatches with string comparison fallback
                     person_row = people_df[people_df['id'] == person_id]
                     if person_row.empty:
                         person_row = people_df[people_df['id'].astype(str) == str(person_id)]
+
+                    # Extract person info
+                    first_name = ""
+                    last_name = ""
+                    phone = ""
+
                     if not person_row.empty:
                         person = person_row.iloc[0]
 
-                        # Extract name and phone data
-                        first_name = ""
-                        last_name = ""
-                        phone = ""
-
                         # Handle different name column formats
-                        if 'first_name' in people_df.columns:
-                            first_name = person.get('first_name', '') or ''
-                        if 'last_name' in people_df.columns:
-                            last_name = person.get('last_name', '') or ''
+                        if 'first_name' in people_df.columns and pd.notna(person['first_name']):
+                            first_name = str(person['first_name']).strip()
+                        if 'last_name' in people_df.columns and pd.notna(person['last_name']):
+                            last_name = str(person['last_name']).strip()
                         if 'name' in people_df.columns and not first_name and not last_name:
-                            full_name = person.get('name', '') or ''
-                            name_parts = full_name.split(' ', 1)
-                            first_name = name_parts[0] if len(name_parts) > 0 else ''
-                            last_name = name_parts[1] if len(name_parts) > 1 else ''
+                            name_val = person['name']
+                            if pd.notna(name_val):
+                                full_name = str(name_val).strip()
+                                name_parts = full_name.split(' ', 1)
+                                first_name = name_parts[0] if len(name_parts) > 0 else ''
+                                last_name = name_parts[1] if len(name_parts) > 1 else ''
 
                         # Handle different phone column formats
                         for phone_col in ['phone', 'phone_number', 'mobile', 'cell']:
                             if phone_col in people_df.columns:
-                                phone = person.get(phone_col, '') or ''
-                                if phone:
+                                phone_val = person[phone_col]
+                                if pd.notna(phone_val) and str(phone_val).strip():
+                                    phone = str(phone_val).strip()
+                                    # Remove .0 suffix from float conversion
+                                    if phone.endswith('.0'):
+                                        phone = phone[:-2]
                                     break
 
-                        non_responder_data.append({
-                            'first_name': first_name,
-                            'last_name': last_name,
-                            'phone_number': phone,
-                            'tag': export_tag
-                        })
+                    # Build export row
+                    row_data = {
+                        'first_name': first_name,
+                        'last_name': last_name,
+                        'phone_number': phone,
+                        'tag': export_tag
+                    }
 
-                if non_responder_data:
-                    export_df = pd.DataFrame(non_responder_data)
+                    # Add conversation if full export type selected
+                    if export_type == "Full Conversation":
+                        person_messages = messages_df[
+                            messages_df['person_id'] == person_id
+                        ].sort_values('created_at')
+
+                        if len(person_messages) > 0:
+                            conversation_array = []
+                            for _, msg in person_messages.iterrows():
+                                direction = "YOU" if msg['direction'] == 'outgoing' else "THEM"
+                                timestamp = msg['created_at'].strftime("%Y-%m-%d %H:%M") if pd.notna(msg['created_at']) else ""
+                                conversation_array.append({
+                                    'direction': direction,
+                                    'timestamp': timestamp,
+                                    'message': msg['body']
+                                })
+                            row_data['conversation'] = json.dumps(conversation_array)
+                        else:
+                            row_data['conversation'] = "[]"
+
+                    export_data.append(row_data)
+
+                if export_data:
+                    export_df = pd.DataFrame(export_data)
 
                     # Convert to CSV
                     csv_data = export_df.to_csv(index=False)
 
                     st.download_button(
-                        label="⬇️ Download Non-Responders CSV",
+                        label="⬇️ Download CSV",
                         data=csv_data,
-                        file_name=f"non_responders_{export_tag}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        file_name=f"{filter_label}_{export_tag}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
                         mime="text/csv"
                     )
 
                     # Preview the data
                     st.subheader("Preview of Export Data:")
                     st.dataframe(export_df.head(10))
-                    st.caption(f"Showing first 10 of {len(export_df)} non-responders")
+                    st.caption(f"Showing first 10 of {len(export_df)} records")
                 else:
                     st.warning("No data available for export")
 
         # Responder details with conversation viewer
         st.header("💬 Responder Details & Conversations")
 
-        responder_ids = messages_df[messages_df['direction'] == 'incoming']['person_id'].unique()
+        # Get all responder IDs
+        all_responder_ids = set(messages_df[messages_df['direction'] == 'incoming']['person_id'].unique())
 
-        if len(responder_ids) > 0:
+        # Get committed person IDs (from the committed_people list if it exists)
+        committed_ids = set()
+        if 'committed_people' in st.session_state and st.session_state['committed_people']:
+            committed_ids = {p['person_id'] for p in st.session_state['committed_people']}
+
+        # Calculate non-responders
+        all_contactable_ids = set(people_with_phones['id'].tolist())
+        non_responder_ids = all_contactable_ids - all_responder_ids
+
+        # Filter options
+        filter_col1, filter_col2 = st.columns([2, 3])
+        with filter_col1:
+            conversation_filter = st.radio(
+                "Filter by",
+                ["All Responders", "Opted Out", "Active (Not Opted Out)", "Committed", "Non-Responders"],
+                horizontal=True
+            )
+
+        # Apply filter
+        if conversation_filter == "All Responders":
+            filtered_ids = list(all_responder_ids)
+            filter_description = f"{len(filtered_ids)} responders"
+        elif conversation_filter == "Opted Out":
+            filtered_ids = list(all_responder_ids & opted_out_people_set)
+            filter_description = f"{len(filtered_ids)} opted out"
+        elif conversation_filter == "Active (Not Opted Out)":
+            filtered_ids = list(all_responder_ids - opted_out_people_set)
+            filter_description = f"{len(filtered_ids)} active responders"
+        elif conversation_filter == "Committed":
+            filtered_ids = list(committed_ids)
+            filter_description = f"{len(filtered_ids)} committed"
+        else:  # Non-Responders
+            filtered_ids = list(non_responder_ids)
+            filter_description = f"{len(filtered_ids)} non-responders"
+
+        with filter_col2:
+            st.caption(f"Showing: {filter_description}")
+
+        if len(filtered_ids) > 0:
             # Create a mapping of person_id to name if available
             def get_display_name(person_id):
                 name = get_person_name(person_id, people_df)
@@ -1381,27 +1568,32 @@ if messages_file and people_file:
                     return f"{name} (ID: {person_id})"
                 return f"Person {person_id}"
 
-            selected_responder = st.selectbox(
-                "Select a responder to view conversation",
-                responder_ids,
+            selected_person = st.selectbox(
+                "Select a person to view conversation",
+                filtered_ids,
                 format_func=get_display_name
             )
 
-            if selected_responder:
-                # Get conversation for selected responder
+            if selected_person:
+                # Get conversation for selected person
                 conversation = messages_df[
-                    messages_df['person_id'] == selected_responder
+                    messages_df['person_id'] == selected_person
                 ].sort_values('created_at')
 
-                st.subheader(f"Conversation with {get_display_name(selected_responder)}")
+                st.subheader(f"Conversation with {get_display_name(selected_person)}")
 
-                for _, msg in conversation.iterrows():
-                    direction_icon = "👤" if msg['direction'] == 'incoming' else "🤖"
-                    timestamp = msg['created_at'].strftime("%Y-%m-%d %H:%M") if pd.notna(msg['created_at']) else "Unknown time"
+                if len(conversation) > 0:
+                    for _, msg in conversation.iterrows():
+                        direction_icon = "👤" if msg['direction'] == 'incoming' else "🤖"
+                        timestamp = msg['created_at'].strftime("%Y-%m-%d %H:%M") if pd.notna(msg['created_at']) else "Unknown time"
 
-                    with st.chat_message("user" if msg['direction'] == 'incoming' else "assistant"):
-                        st.write(f"**{direction_icon} {timestamp}**")
-                        st.write(msg['body'])
+                        with st.chat_message("user" if msg['direction'] == 'incoming' else "assistant"):
+                            st.write(f"**{direction_icon} {timestamp}**")
+                            st.write(msg['body'])
+                else:
+                    st.info("No messages found for this person (non-responder)")
+        else:
+            st.info(f"No people found matching filter: {conversation_filter}")
 
     except Exception as e:
         import traceback
