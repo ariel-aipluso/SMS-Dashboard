@@ -144,7 +144,7 @@ def format_conversation_for_llm(person_messages_df):
         lines.append(f"{direction}: {body}")
     return "\n".join(lines)
 
-PROMPT_VERSION = "v7"  # Increment this when changing the prompt to bust cache
+PROMPT_VERSION = "v15"  # Increment this when changing the prompt to bust cache
 
 # Default prompts for AI verification
 DEFAULT_OPTOUT_PROMPT = """Look at this SMS conversation. Did the person (THEM) send "STOP" to unsubscribe?
@@ -163,22 +163,28 @@ CONVERSATION:
 
 Reply with ONLY one word: YES or NO"""
 
-DEFAULT_COMMITMENT_PROMPT = """Analyze this SMS conversation. Did the person (THEM) commit to attending an event at ANY point in the conversation?
+DEFAULT_COMMITMENT_PROMPT = """Did THEM agree to take an action they were asked to do?
 
-Answer YES if ANYWHERE in the conversation THEM:
-- Said "yes", "yeah", "yep", "sure", or similar when asked to attend/join an event
-- Used phrases like "I'll be there", "count me in", "I'm coming", "I'm in", "sign me up"
+Actions include: making a call, attending an event, gathering others.
+Also count: alternative actions if they already completed the original ask (e.g., "I already called, but I can attend the event").
 
-Note: THEM may say "yes" multiple times for different reasons (e.g., yes to attend, yes they know someone, yes they want help). Look for ANY "yes" that was in response to an invitation to attend an event.
+IMPORTANT: Only count responses that are direct answers to an action request.
+- Agreeing with an opinion or cause is NOT a commitment
+- They must respond AFTER being asked to take action
+- If they never responded to the action request, answer NO
 
-Answer NO only if:
-- THEM never said yes to attending the event itself
-- THEM explicitly declined the invitation
+YES = They agreed, committed, or already completed an action.
+NO = They never agreed, explicitly declined, never responded to the ask, or only engaged without committing.
+
+Score (0-100) = How confident are you in your YES or NO judgment?
+High confidence means the answer is clear. Low confidence means it's ambiguous.
+
+Note: Unanswered follow-up questions or silence after committing does not cancel a commitment.
 
 CONVERSATION:
 {conversation}
 
-Reply with ONLY one word: YES or NO"""
+RESPOND WITH ONLY: YES ## or NO ##"""
 
 def analyze_conversations_with_anthropic(conversations: dict, api_key: str, custom_prompt: str = None) -> dict:
     """
@@ -261,13 +267,35 @@ def analyze_commitments_with_anthropic(conversations: dict, api_key: str, custom
 
         try:
             response = client.messages.create(
-                model="claude-3-5-haiku-20241022",
-                max_tokens=10,
+                model="claude-sonnet-4-20250514",
+                max_tokens=50,
                 messages=[{"role": "user", "content": prompt}]
             )
             response_text = response.content[0].text.strip().upper()
-            is_committed = response_text.startswith("YES")
-            results[person_id] = {"is_committed": is_committed}
+
+            # Parse response for YES/NO and confidence score anywhere in response
+            # Handle formats: "YES 95", "YES95", "YES - 95", "YES: 95%", "YES (95%)", etc.
+            match = re.search(r'(YES|NO)[\s:\-\(]*(\d+)', response_text)
+            if match:
+                answer = match.group(1)
+                confidence = int(match.group(2))
+                # Only count as committed if YES with >=85% confidence
+                is_committed = (answer == "YES" and confidence >= 85)
+                results[person_id] = {"is_committed": is_committed, "confidence": confidence, "raw_answer": answer}
+            else:
+                # No confidence score found - search for YES/NO anywhere in response
+                yes_match = re.search(r'\bYES\b', response_text)
+                no_match = re.search(r'\bNO\b', response_text)
+
+                if yes_match and not no_match:
+                    # Found YES but no confidence - treat as low confidence
+                    results[person_id] = {"is_committed": False, "confidence": 50, "raw_answer": "YES", "note": "no_confidence"}
+                elif no_match:
+                    # Found NO (or both) - default to NO
+                    results[person_id] = {"is_committed": False, "confidence": 50, "raw_answer": "NO", "note": "no_confidence"}
+                else:
+                    # Couldn't parse - default to NO with 0 confidence
+                    results[person_id] = {"is_committed": False, "confidence": 0, "raw_answer": "NO", "note": "parse_failed"}
 
         except Exception as e:
             results[person_id] = {"is_committed": "unknown", "error": str(e)}
@@ -291,12 +319,34 @@ def analyze_commitments_with_openai(conversations: dict, api_key: str, custom_pr
         try:
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
-                max_tokens=10,
+                max_tokens=50,
                 messages=[{"role": "user", "content": prompt}]
             )
             response_text = response.choices[0].message.content.strip().upper()
-            is_committed = response_text.startswith("YES")
-            results[person_id] = {"is_committed": is_committed}
+
+            # Parse response for YES/NO and confidence score anywhere in response
+            # Handle formats: "YES 95", "YES95", "YES - 95", "YES: 95%", "YES (95%)", etc.
+            match = re.search(r'(YES|NO)[\s:\-\(]*(\d+)', response_text)
+            if match:
+                answer = match.group(1)
+                confidence = int(match.group(2))
+                # Only count as committed if YES with >=85% confidence
+                is_committed = (answer == "YES" and confidence >= 85)
+                results[person_id] = {"is_committed": is_committed, "confidence": confidence, "raw_answer": answer}
+            else:
+                # No confidence score found - search for YES/NO anywhere in response
+                yes_match = re.search(r'\bYES\b', response_text)
+                no_match = re.search(r'\bNO\b', response_text)
+
+                if yes_match and not no_match:
+                    # Found YES but no confidence - treat as low confidence
+                    results[person_id] = {"is_committed": False, "confidence": 50, "raw_answer": "YES", "note": "no_confidence"}
+                elif no_match:
+                    # Found NO (or both) - default to NO
+                    results[person_id] = {"is_committed": False, "confidence": 50, "raw_answer": "NO", "note": "no_confidence"}
+                else:
+                    # Couldn't parse - default to NO with 0 confidence
+                    results[person_id] = {"is_committed": False, "confidence": 0, "raw_answer": "NO", "note": "parse_failed"}
 
         except Exception as e:
             results[person_id] = {"is_committed": "unknown", "error": str(e)}
@@ -1168,8 +1218,15 @@ if messages_file and people_file:
                         for person_id, info in responder_info.items():
                             result = llm_results.get(person_id, {"is_committed": "unknown"})
                             status = result.get('is_committed')
+                            confidence = result.get('confidence')
+                            raw_answer = result.get('raw_answer', '')
 
                             person_data = info.copy()
+                            # Format confidence display
+                            if confidence is not None:
+                                person_data['confidence'] = f"{raw_answer} {confidence}%"
+                            else:
+                                person_data['confidence'] = f"{raw_answer} (no score)"
 
                             if status == "unknown":
                                 person_data['detection_method'] = 'AI Unknown'
@@ -1203,7 +1260,8 @@ if messages_file and people_file:
                                     'person_id': msg['person_id'],
                                     'commitment_date': msg['created_at'],
                                     'raw_message': msg['body'],
-                                    'detection_method': 'Keyword'
+                                    'detection_method': 'Keyword',
+                                    'confidence': 'N/A'
                                 })
 
                     committed_people = keyword_committed_people
@@ -1256,10 +1314,12 @@ if messages_file and people_file:
                     display_cols = ['person_name', 'commitment_date_formatted', 'raw_message']
                     col_names = ['Person', 'Date', 'Message']
 
-                    # Add detection method if LLM was used
+                    # Add detection method and confidence if LLM was used
                     if use_llm_commitment and llm_provider and llm_api_key:
                         display_cols.insert(2, 'detection_method')
                         col_names.insert(2, 'Status')
+                        display_cols.insert(3, 'confidence')
+                        col_names.insert(3, 'Confidence (>=85)')
 
                     display_df = all_df[display_cols].copy()
                     display_df.columns = col_names
