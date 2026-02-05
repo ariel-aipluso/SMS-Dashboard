@@ -144,7 +144,7 @@ def format_conversation_for_llm(person_messages_df):
         lines.append(f"{direction}: {body}")
     return "\n".join(lines)
 
-PROMPT_VERSION = "v15"  # Increment this when changing the prompt to bust cache
+PROMPT_VERSION = "v16"  # Increment this when changing the prompt to bust cache
 
 # Default prompts for AI verification
 DEFAULT_OPTOUT_PROMPT = """Look at this SMS conversation. Did the person (THEM) send "STOP" to unsubscribe?
@@ -166,20 +166,26 @@ Reply with ONLY one word: YES or NO"""
 DEFAULT_COMMITMENT_PROMPT = """Did THEM agree to take an action they were asked to do?
 
 Actions include: making a call, attending an event, gathering others.
-Also count: alternative actions if they already completed the original ask (e.g., "I already called, but I can attend the event").
+Also count: alternative actions if they already completed the original ask.
 
-IMPORTANT: Only count responses that are direct answers to an action request.
-- Agreeing with an opinion or cause is NOT a commitment
-- They must respond AFTER being asked to take action
-- If they never responded to the action request, answer NO
+CRITICAL RULE - Check the SEQUENCE:
+1. Find where YOU asked THEM to take action (call, attend, etc.)
+2. Did THEM respond AFTER that action request?
+3. If THEM's last message was BEFORE the action request, answer NO
 
-YES = They agreed, committed, or already completed an action.
-NO = They never agreed, explicitly declined, never responded to the ask, or only engaged without committing.
+COMMON MISTAKE TO AVOID:
+- YOU: "Do you think X is fair?"
+- THEM: "No, it's not fair!" (this is an OPINION, not a commitment)
+- YOU: "Would you make a call?"
+- THEM: [no response]
+This is NO 95 - they only answered the opinion question, never the action request.
 
-Score (0-100) = How confident are you in your YES or NO judgment?
-High confidence means the answer is clear. Low confidence means it's ambiguous.
+YES = They responded to an action request with agreement
+NO = They only expressed opinions, never responded to action request, or declined
 
-Note: Unanswered follow-up questions or silence after committing does not cancel a commitment.
+Score (0-100) = Your confidence. Be consistent: similar conversations should get similar scores.
+
+Note: Unanswered follow-ups about timing after committing don't cancel a commitment.
 
 CONVERSATION:
 {conversation}
