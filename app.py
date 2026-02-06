@@ -1338,8 +1338,11 @@ if messages_file and people_file:
                     # Use AI summary if available, otherwise raw message
                     if use_llm_commitment and llm_provider and llm_api_key and 'ai_summary' in all_df.columns:
                         display_cols = ['person_name', 'commitment_date_formatted', 'detection_method', 'confidence', 'ai_summary']
-                        col_names = ['Person', 'Date', 'Status', 'Confidence (>=85)', 'AI Summary']
+                        col_names = ['Person', 'Date', 'Status', 'Confidence', 'AI Summary']
                         column_config = {
+                            'Status': st.column_config.TextColumn(
+                                help="AI Verified = YES with Confidence ≥ 85%"
+                            ),
                             'AI Summary': st.column_config.TextColumn(width=800)
                         }
                     else:
