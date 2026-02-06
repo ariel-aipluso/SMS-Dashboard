@@ -144,7 +144,7 @@ def format_conversation_for_llm(person_messages_df):
         lines.append(f"{direction}: {body}")
     return "\n".join(lines)
 
-PROMPT_VERSION = "v16"  # Increment this when changing the prompt to bust cache
+PROMPT_VERSION = "v17"  # Increment this when changing the prompt to bust cache
 
 # Default prompts for AI verification
 DEFAULT_OPTOUT_PROMPT = """Look at this SMS conversation. Did the person (THEM) send "STOP" to unsubscribe?
@@ -190,7 +190,9 @@ Note: Unanswered follow-ups about timing after committing don't cancel a commitm
 CONVERSATION:
 {conversation}
 
-RESPOND WITH ONLY: YES ## or NO ##"""
+RESPOND WITH: YES ## or NO ## followed by a one-sentence summary explaining why.
+Example: YES 92 - THEM agreed to attend the rally after being asked to join.
+Example: NO 95 - THEM only answered the opinion question; they never responded to the action request."""
 
 def analyze_conversations_with_anthropic(conversations: dict, api_key: str, custom_prompt: str = None) -> dict:
     """
@@ -274,34 +276,40 @@ def analyze_commitments_with_anthropic(conversations: dict, api_key: str, custom
         try:
             response = client.messages.create(
                 model="claude-sonnet-4-20250514",
-                max_tokens=50,
+                max_tokens=100,
                 messages=[{"role": "user", "content": prompt}]
             )
-            response_text = response.content[0].text.strip().upper()
+            response_text = response.content[0].text.strip()
+            response_upper = response_text.upper()
 
             # Parse response for YES/NO and confidence score anywhere in response
             # Handle formats: "YES 95", "YES95", "YES - 95", "YES: 95%", "YES (95%)", etc.
-            match = re.search(r'(YES|NO)[\s:\-\(]*(\d+)', response_text)
+            match = re.search(r'(YES|NO)[\s:\-\(]*(\d+)', response_upper)
             if match:
                 answer = match.group(1)
                 confidence = int(match.group(2))
                 # Only count as committed if YES with >=85% confidence
                 is_committed = (answer == "YES" and confidence >= 85)
-                results[person_id] = {"is_committed": is_committed, "confidence": confidence, "raw_answer": answer}
+
+                # Extract summary after the confidence score (after " - " or similar)
+                summary_match = re.search(r'(?:YES|NO)\s*\d+\s*[-–—]\s*(.+)', response_text, re.IGNORECASE)
+                summary = summary_match.group(1).strip() if summary_match else None
+
+                results[person_id] = {"is_committed": is_committed, "confidence": confidence, "raw_answer": answer, "summary": summary}
             else:
                 # No confidence score found - search for YES/NO anywhere in response
-                yes_match = re.search(r'\bYES\b', response_text)
-                no_match = re.search(r'\bNO\b', response_text)
+                yes_match = re.search(r'\bYES\b', response_upper)
+                no_match = re.search(r'\bNO\b', response_upper)
 
                 if yes_match and not no_match:
                     # Found YES but no confidence - treat as low confidence
-                    results[person_id] = {"is_committed": False, "confidence": 50, "raw_answer": "YES", "note": "no_confidence"}
+                    results[person_id] = {"is_committed": False, "confidence": 50, "raw_answer": "YES", "note": "no_confidence", "summary": None}
                 elif no_match:
                     # Found NO (or both) - default to NO
-                    results[person_id] = {"is_committed": False, "confidence": 50, "raw_answer": "NO", "note": "no_confidence"}
+                    results[person_id] = {"is_committed": False, "confidence": 50, "raw_answer": "NO", "note": "no_confidence", "summary": None}
                 else:
                     # Couldn't parse - default to NO with 0 confidence
-                    results[person_id] = {"is_committed": False, "confidence": 0, "raw_answer": "NO", "note": "parse_failed"}
+                    results[person_id] = {"is_committed": False, "confidence": 0, "raw_answer": "NO", "note": "parse_failed", "summary": None}
 
         except Exception as e:
             results[person_id] = {"is_committed": "unknown", "error": str(e)}
@@ -325,34 +333,40 @@ def analyze_commitments_with_openai(conversations: dict, api_key: str, custom_pr
         try:
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
-                max_tokens=50,
+                max_tokens=100,
                 messages=[{"role": "user", "content": prompt}]
             )
-            response_text = response.choices[0].message.content.strip().upper()
+            response_text = response.choices[0].message.content.strip()
+            response_upper = response_text.upper()
 
             # Parse response for YES/NO and confidence score anywhere in response
             # Handle formats: "YES 95", "YES95", "YES - 95", "YES: 95%", "YES (95%)", etc.
-            match = re.search(r'(YES|NO)[\s:\-\(]*(\d+)', response_text)
+            match = re.search(r'(YES|NO)[\s:\-\(]*(\d+)', response_upper)
             if match:
                 answer = match.group(1)
                 confidence = int(match.group(2))
                 # Only count as committed if YES with >=85% confidence
                 is_committed = (answer == "YES" and confidence >= 85)
-                results[person_id] = {"is_committed": is_committed, "confidence": confidence, "raw_answer": answer}
+
+                # Extract summary after the confidence score (after " - " or similar)
+                summary_match = re.search(r'(?:YES|NO)\s*\d+\s*[-–—]\s*(.+)', response_text, re.IGNORECASE)
+                summary = summary_match.group(1).strip() if summary_match else None
+
+                results[person_id] = {"is_committed": is_committed, "confidence": confidence, "raw_answer": answer, "summary": summary}
             else:
                 # No confidence score found - search for YES/NO anywhere in response
-                yes_match = re.search(r'\bYES\b', response_text)
-                no_match = re.search(r'\bNO\b', response_text)
+                yes_match = re.search(r'\bYES\b', response_upper)
+                no_match = re.search(r'\bNO\b', response_upper)
 
                 if yes_match and not no_match:
                     # Found YES but no confidence - treat as low confidence
-                    results[person_id] = {"is_committed": False, "confidence": 50, "raw_answer": "YES", "note": "no_confidence"}
+                    results[person_id] = {"is_committed": False, "confidence": 50, "raw_answer": "YES", "note": "no_confidence", "summary": None}
                 elif no_match:
                     # Found NO (or both) - default to NO
-                    results[person_id] = {"is_committed": False, "confidence": 50, "raw_answer": "NO", "note": "no_confidence"}
+                    results[person_id] = {"is_committed": False, "confidence": 50, "raw_answer": "NO", "note": "no_confidence", "summary": None}
                 else:
                     # Couldn't parse - default to NO with 0 confidence
-                    results[person_id] = {"is_committed": False, "confidence": 0, "raw_answer": "NO", "note": "parse_failed"}
+                    results[person_id] = {"is_committed": False, "confidence": 0, "raw_answer": "NO", "note": "parse_failed", "summary": None}
 
         except Exception as e:
             results[person_id] = {"is_committed": "unknown", "error": str(e)}
@@ -1226,6 +1240,7 @@ if messages_file and people_file:
                             status = result.get('is_committed')
                             confidence = result.get('confidence')
                             raw_answer = result.get('raw_answer', '')
+                            summary = result.get('summary')
 
                             person_data = info.copy()
                             # Format confidence display
@@ -1233,6 +1248,9 @@ if messages_file and people_file:
                                 person_data['confidence'] = f"{raw_answer} {confidence}%"
                             else:
                                 person_data['confidence'] = f"{raw_answer} (no score)"
+
+                            # Store AI summary (fallback to raw_message if no summary)
+                            person_data['ai_summary'] = summary if summary else person_data['raw_message']
 
                             if status == "unknown":
                                 person_data['detection_method'] = 'AI Unknown'
@@ -1317,20 +1335,24 @@ if messages_file and people_file:
                     all_df = pd.DataFrame(all_people)
                     all_df['commitment_date_formatted'] = all_df['commitment_date'].dt.strftime('%Y-%m-%d %H:%M')
 
-                    display_cols = ['person_name', 'commitment_date_formatted', 'raw_message']
-                    col_names = ['Person', 'Date', 'Message']
-
-                    # Add detection method and confidence if LLM was used
-                    if use_llm_commitment and llm_provider and llm_api_key:
-                        display_cols.insert(2, 'detection_method')
-                        col_names.insert(2, 'Status')
-                        display_cols.insert(3, 'confidence')
-                        col_names.insert(3, 'Confidence (>=85)')
+                    # Use AI summary if available, otherwise raw message
+                    if use_llm_commitment and llm_provider and llm_api_key and 'ai_summary' in all_df.columns:
+                        display_cols = ['person_name', 'commitment_date_formatted', 'detection_method', 'confidence', 'ai_summary']
+                        col_names = ['Person', 'Date', 'Status', 'Confidence (>=85)', 'AI Summary']
+                        column_config = {
+                            'AI Summary': st.column_config.TextColumn(width=800)
+                        }
+                    else:
+                        display_cols = ['person_name', 'commitment_date_formatted', 'raw_message']
+                        col_names = ['Person', 'Date', 'Message']
+                        column_config = {
+                            'Message': st.column_config.TextColumn(width=400)
+                        }
 
                     display_df = all_df[display_cols].copy()
                     display_df.columns = col_names
 
-                    st.dataframe(display_df, use_container_width=True)
+                    st.dataframe(display_df, use_container_width=True, column_config=column_config)
             else:
                 st.info("No action commitments detected in the conversation data")
 
