@@ -113,3 +113,23 @@ def multiplier_keywords():
         "coworkers", "colleagues",
         "recruit", "get others", "reach out"
     ]
+
+
+@pytest.fixture
+def variant_messages_df():
+    """Messages DataFrame with message_variant_name on outgoing messages."""
+    return pd.DataFrame([
+        # Variant A conversations
+        {'person_id': 1, 'direction': 'outgoing', 'body': 'Will you attend the rally?', 'created_at': '2026-01-01 10:00:00', 'message_variant_name': 'Variant A'},
+        {'person_id': 1, 'direction': 'incoming', 'body': 'Yes, I will be there!', 'created_at': '2026-01-01 10:05:00', 'message_variant_name': ''},
+        {'person_id': 2, 'direction': 'outgoing', 'body': 'Will you attend the rally?', 'created_at': '2026-01-01 10:00:00', 'message_variant_name': 'Variant A'},
+        {'person_id': 2, 'direction': 'incoming', 'body': 'STOP', 'created_at': '2026-01-01 10:10:00', 'message_variant_name': ''},
+        # Variant B conversations
+        {'person_id': 3, 'direction': 'outgoing', 'body': 'Join us at the community event!', 'created_at': '2026-01-01 10:00:00', 'message_variant_name': 'Variant B'},
+        {'person_id': 3, 'direction': 'incoming', 'body': 'Count me in, I made the call already', 'created_at': '2026-01-01 10:05:00', 'message_variant_name': ''},
+        {'person_id': 4, 'direction': 'outgoing', 'body': 'Join us at the community event!', 'created_at': '2026-01-01 10:00:00', 'message_variant_name': 'Variant B'},
+        {'person_id': 4, 'direction': 'incoming', 'body': 'Maybe later', 'created_at': '2026-01-01 10:10:00', 'message_variant_name': ''},
+        # Person with no variant
+        {'person_id': 5, 'direction': 'outgoing', 'body': 'Hello there', 'created_at': '2026-01-01 10:00:00', 'message_variant_name': ''},
+        {'person_id': 5, 'direction': 'incoming', 'body': 'Hi', 'created_at': '2026-01-01 10:05:00', 'message_variant_name': ''},
+    ])
