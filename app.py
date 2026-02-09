@@ -8,6 +8,7 @@ import re
 import os
 import json
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Optional: LLM providers for AI-based verification
@@ -73,7 +74,10 @@ st.caption(f"Version: {get_version_date()}")
 
 # File upload section
 st.sidebar.header("📂 Data Upload")
-messages_file = st.sidebar.file_uploader("Upload Messages CSV", type=['csv'])
+messages_files = st.sidebar.file_uploader(
+    "Upload Messages CSV(s)", type=['csv'], accept_multiple_files=True,
+    help="Upload one or more message exports (Campaign, Flow, All Messages). Files with the same message IDs will be merged."
+)
 people_file = st.sidebar.file_uploader("Upload People CSV", type=['csv'])
 
 def normalize_phone(phone):
@@ -134,6 +138,55 @@ def get_person_name(person_id, people_df):
             if is_valid(name_val):
                 return str(name_val)
     return None
+
+def reconcile_message_files(uploaded_files):
+    """Load and reconcile multiple message CSV files using 'id' as primary key."""
+    if not uploaded_files:
+        return pd.DataFrame(), []
+
+    file_info = []
+    dataframes = []
+
+    for f in uploaded_files:
+        chunks = pd.read_csv(f, chunksize=50000)
+        df = pd.concat(chunks, ignore_index=True)
+
+        cols = set(df.columns)
+        has_variant = 'message_variant_name' in cols
+        has_person_id = 'person_id' in cols
+        has_automation_name = 'automation_name' in cols
+
+        if has_variant and has_automation_name:
+            export_type = 'Flow'
+        elif has_variant:
+            export_type = 'Campaign'
+        elif has_person_id:
+            export_type = 'All Messages'
+        else:
+            export_type = 'Unknown'
+
+        file_info.append({
+            'filename': f.name,
+            'rows': len(df),
+            'export_type': export_type,
+        })
+        dataframes.append(df)
+
+    if len(dataframes) == 1:
+        return dataframes[0], file_info
+
+    has_id_col = all('id' in df.columns for df in dataframes)
+
+    if has_id_col:
+        base = dataframes[0].set_index('id')
+        for df in dataframes[1:]:
+            other = df.set_index('id')
+            base = base.combine_first(other)
+        messages_df = base.reset_index()
+    else:
+        messages_df = pd.concat(dataframes, ignore_index=True)
+
+    return messages_df, file_info
 
 # LLM-based verification using Claude or OpenAI (conversation-aware)
 def format_conversation_for_llm(person_messages_df):
@@ -463,6 +516,20 @@ def _variant_eval_fallback():
     }
 
 VARIANT_EVAL_MAX_WORKERS = 10
+VARIANT_EVAL_MAX_RETRIES = 3
+
+def _api_call_with_retry(fn, max_retries=VARIANT_EVAL_MAX_RETRIES):
+    """Call fn() with exponential backoff on rate limit / server errors."""
+    for attempt in range(max_retries):
+        try:
+            return fn(), None
+        except Exception as e:
+            err_str = str(e).lower()
+            is_retryable = any(k in err_str for k in ['rate', '429', '529', 'overloaded', 'timeout', 'capacity'])
+            if is_retryable and attempt < max_retries - 1:
+                time.sleep(2 ** attempt + 1)
+                continue
+            return None, str(e)
 
 def analyze_variant_eval_with_anthropic(conversations: dict, api_key: str, custom_prompt: str = None, progress_callback=None) -> dict:
     """Use Claude to evaluate conversations concurrently for variant comparison."""
@@ -474,15 +541,17 @@ def analyze_variant_eval_with_anthropic(conversations: dict, api_key: str, custo
 
     def _eval_one(person_id, conversation):
         prompt = prompt_template.format(conversation=conversation)
-        try:
+        def _call():
             response = client.messages.create(
                 model="claude-sonnet-4-20250514",
                 max_tokens=450,
                 messages=[{"role": "user", "content": prompt}]
             )
-            return person_id, parse_variant_eval_response(response.content[0].text.strip())
-        except Exception as e:
-            return person_id, _variant_eval_fallback()
+            return parse_variant_eval_response(response.content[0].text.strip())
+        result, err = _api_call_with_retry(_call)
+        if err:
+            return person_id, None, err
+        return person_id, result, None
 
     results = {}
     errors = []
@@ -491,16 +560,19 @@ def analyze_variant_eval_with_anthropic(conversations: dict, api_key: str, custo
     with ThreadPoolExecutor(max_workers=VARIANT_EVAL_MAX_WORKERS) as executor:
         futures = {executor.submit(_eval_one, pid, conv): pid for pid, conv in conversations.items()}
         for future in as_completed(futures):
-            person_id, result = future.result()
-            results[person_id] = result
-            if result == _variant_eval_fallback():
-                errors.append(person_id)
+            person_id, result, err = future.result()
+            if err:
+                results[person_id] = _variant_eval_fallback()
+                errors.append((person_id, err))
+            else:
+                results[person_id] = result
             completed += 1
             if progress_callback:
                 progress_callback(completed, total)
 
     if errors:
-        st.warning(f"Variant eval API errors for {len(errors)} conversation(s)")
+        sample = errors[0][1]
+        st.warning(f"Variant eval API errors for {len(errors)} conversation(s) after {VARIANT_EVAL_MAX_RETRIES} retries. Sample error: {sample}")
     return results
 
 def analyze_variant_eval_with_openai(conversations: dict, api_key: str, custom_prompt: str = None, progress_callback=None) -> dict:
@@ -513,15 +585,17 @@ def analyze_variant_eval_with_openai(conversations: dict, api_key: str, custom_p
 
     def _eval_one(person_id, conversation):
         prompt = prompt_template.format(conversation=conversation)
-        try:
+        def _call():
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 max_tokens=450,
                 messages=[{"role": "user", "content": prompt}]
             )
-            return person_id, parse_variant_eval_response(response.choices[0].message.content.strip())
-        except Exception as e:
-            return person_id, _variant_eval_fallback()
+            return parse_variant_eval_response(response.choices[0].message.content.strip())
+        result, err = _api_call_with_retry(_call)
+        if err:
+            return person_id, None, err
+        return person_id, result, None
 
     results = {}
     errors = []
@@ -530,25 +604,32 @@ def analyze_variant_eval_with_openai(conversations: dict, api_key: str, custom_p
     with ThreadPoolExecutor(max_workers=VARIANT_EVAL_MAX_WORKERS) as executor:
         futures = {executor.submit(_eval_one, pid, conv): pid for pid, conv in conversations.items()}
         for future in as_completed(futures):
-            person_id, result = future.result()
-            results[person_id] = result
-            if result == _variant_eval_fallback():
-                errors.append(person_id)
+            person_id, result, err = future.result()
+            if err:
+                results[person_id] = _variant_eval_fallback()
+                errors.append((person_id, err))
+            else:
+                results[person_id] = result
             completed += 1
             if progress_callback:
                 progress_callback(completed, total)
 
     if errors:
-        st.warning(f"Variant eval API errors for {len(errors)} conversation(s)")
+        sample = errors[0][1]
+        st.warning(f"Variant eval API errors for {len(errors)} conversation(s) after {VARIANT_EVAL_MAX_RETRIES} retries. Sample error: {sample}")
     return results
 
 def get_person_variant(messages_df):
-    """Map person_id -> message_variant_name from first outgoing message."""
-    outgoing = messages_df[
+    """Map person_id -> message_variant_name from initial broadcast messages only."""
+    mask = (
         (messages_df['direction'] == 'outgoing') &
         (messages_df['message_variant_name'].notna()) &
         (messages_df['message_variant_name'].astype(str).str.strip() != '')
-    ].sort_values('created_at')
+    )
+    # Exclude AI flow responses (message_node_name set) to only count broadcast recipients
+    if 'message_node_name' in messages_df.columns:
+        mask = mask & (messages_df['message_node_name'].isna() | (messages_df['message_node_name'].astype(str).str.strip() == ''))
+    outgoing = messages_df[mask].sort_values('created_at')
     return outgoing.drop_duplicates('person_id', keep='first').set_index('person_id')['message_variant_name'].to_dict()
 
 ACTION_TYPES = ['call', 'letter', 'meeting']
@@ -759,10 +840,26 @@ if ANTHROPIC_AVAILABLE or OPENAI_AVAILABLE:
         # Determine if we have a centralized key available
         has_centralized_key = bool(centralized_anthropic or centralized_openai)
 
-        if has_centralized_key:
+        # Build list of available providers from centralized keys
+        available_providers = []
+        if centralized_anthropic:
+            available_providers.append("Anthropic (Claude)")
+        if centralized_openai:
+            available_providers.append("OpenAI (GPT-4o-mini)")
+
+        if available_providers:
             st.sidebar.success("AI features enabled")
+            if len(available_providers) > 1:
+                provider_choice = st.sidebar.radio(
+                    "AI Provider",
+                    available_providers,
+                    key="llm_provider_choice"
+                )
+            else:
+                provider_choice = available_providers[0]
         else:
             st.sidebar.caption("Enter an API key to enable AI:")
+            provider_choice = None
 
         # Optional override section
         with st.sidebar.expander("Use your own API key (optional)"):
@@ -784,17 +881,19 @@ if ANTHROPIC_AVAILABLE or OPENAI_AVAILABLE:
                     help="From platform.openai.com (uses GPT-4o-mini)"
                 )
 
-        # Resolve final API key: user override > centralized
-        anthropic_key = anthropic_key_override or centralized_anthropic
-        openai_key = openai_key_override or centralized_openai
-
-        # Use whichever key is available (prefer Anthropic if both)
-        if anthropic_key:
+        # Resolve final key: user override > centralized provider choice
+        if anthropic_key_override:
             llm_provider = "anthropic"
-            llm_api_key = anthropic_key
-        elif openai_key:
+            llm_api_key = anthropic_key_override
+        elif openai_key_override:
             llm_provider = "openai"
-            llm_api_key = openai_key
+            llm_api_key = openai_key_override
+        elif provider_choice and "Anthropic" in provider_choice:
+            llm_provider = "anthropic"
+            llm_api_key = centralized_anthropic
+        elif provider_choice and "OpenAI" in provider_choice:
+            llm_provider = "openai"
+            llm_api_key = centralized_openai
         else:
             st.sidebar.warning("Enter an API key to enable AI verification")
             use_llm_optout = False
@@ -852,11 +951,13 @@ optout_prompt_template = st.session_state.get('custom_optout_prompt', DEFAULT_OP
 commitment_prompt_template = st.session_state.get('custom_commitment_prompt', DEFAULT_COMMITMENT_PROMPT)
 variant_eval_prompt_template = st.session_state.get('custom_variant_eval_prompt', DEFAULT_VARIANT_EVAL_PROMPT)
 
-if messages_file and people_file:
-    # Load data
+if messages_files and people_file:
+    # Load data (messages first - higher priority)
     try:
-        messages_df = pd.read_csv(messages_file)
-        people_df = pd.read_csv(people_file)
+        messages_df, file_info = reconcile_message_files(messages_files)
+
+        people_chunks = pd.read_csv(people_file, chunksize=50000)
+        people_df = pd.concat(people_chunks, ignore_index=True)
 
         # Parse tags early for exclusion filter
         excluded_tags = []
@@ -934,6 +1035,14 @@ if messages_file and people_file:
         # Collect loading messages for collapsed display
         loading_messages = []
 
+        # Report file reconciliation details
+        if len(file_info) > 1:
+            for fi in file_info:
+                loading_messages.append(("info", f"📄 {fi['filename']}: {fi['rows']:,} rows ({fi['export_type']} export)"))
+            loading_messages.append(("success", f"🔗 Reconciled {len(file_info)} files into {len(messages_df):,} unique messages"))
+        elif len(file_info) == 1:
+            loading_messages.append(("info", f"📄 {file_info[0]['filename']} ({file_info[0]['export_type']} export)"))
+
         # Handle different message CSV formats
         if 'conversation_id' in messages_df.columns and 'from' in messages_df.columns:
             # Alternative format: conversation_id with from/to columns
@@ -1006,6 +1115,9 @@ if messages_file and people_file:
 
             # Create person_id mapping for messages
             def get_person_id_for_row(row):
+                # Preserve existing person_id from merged All Messages export
+                if 'person_id' in row.index and pd.notna(row.get('person_id')):
+                    return row['person_id']
                 conv_id = row['conversation_id']
                 phone = row['to'] if row['direction'] == 'outgoing' else row['from']
 
@@ -1923,7 +2035,102 @@ if messages_file and people_file:
 
         with tab_variant:
 
-            if 'message_variant_name' not in messages_df.columns:
+            # Import previous evaluation results
+            imported_eval_file = st.file_uploader(
+                "Import previous evaluation results", type=['json'],
+                help="Load results from a previous variant evaluation run to skip API calls",
+                key="variant_eval_import"
+            )
+
+            if imported_eval_file:
+                try:
+                    imported_data = json.loads(imported_eval_file.read())
+                    eval_results = {k: v for k, v in imported_data['eval_results'].items()}
+                    person_variant_map = imported_data['person_variant_map']
+                    responder_pids = set(imported_data.get('responder_ids', []))
+                    variant_optout_ids = set(imported_data.get('optout_ids', []))
+                    variant_names = sorted(set(person_variant_map.values()))
+
+                    variant_summary_df = aggregate_variant_metrics(eval_results, person_variant_map, responder_pids, variant_optout_ids)
+
+                    meta = imported_data.get('metadata', {})
+                    st.success(f"Loaded {meta.get('n_conversations', len(eval_results))} evaluation results (from {meta.get('timestamp', 'unknown')}, via {meta.get('provider', 'unknown')})")
+
+                    # Store in session state for display
+                    st.session_state['variant_eval_results'] = eval_results
+                    st.session_state['variant_eval_aggregated'] = variant_summary_df
+                    st.session_state['variant_eval_responder_ids'] = responder_pids
+                    st.session_state['variant_eval_optout_ids'] = variant_optout_ids
+                except Exception as e:
+                    st.error(f"Error loading evaluation results: {e}")
+                    imported_eval_file = None
+
+            if imported_eval_file and eval_results is not None and variant_summary_df is not None and not variant_summary_df.empty:
+                # Display imported results
+                m1, m2, m3 = st.columns(3)
+                with m1:
+                    st.metric("Variants", len(variant_names))
+                with m2:
+                    st.metric("Conversations Evaluated", len(eval_results))
+                with m3:
+                    avg_reply = variant_summary_df['_reply_rate'].mean()
+                    st.metric("Avg Reply Rate", f"{avg_reply:.1f}%")
+
+                display_cols = ['Variant', 'Total Recipients', 'Total Responders', 'Reply Rate', 'Opt-out Rate',
+                                'Active Responders',
+                                'Call Commit', 'Call Follow-through',
+                                'Letter Commit', 'Letter Follow-through',
+                                'Meeting Commit', 'Meeting Follow-through']
+                st.dataframe(variant_summary_df[display_cols], use_container_width=True, hide_index=True)
+
+                # Export re-share button
+                export_eval_data = {
+                    'eval_results': eval_results,
+                    'person_variant_map': {str(k): v for k, v in person_variant_map.items()},
+                    'responder_ids': [str(x) for x in responder_pids],
+                    'optout_ids': [str(x) for x in variant_optout_ids],
+                    'metadata': {
+                        'timestamp': pd.Timestamp.now().isoformat(),
+                        'provider': meta.get('provider', 'imported'),
+                        'n_conversations': len(eval_results),
+                    }
+                }
+                st.download_button(
+                    "⬇️ Export Variant Eval Results",
+                    data=json.dumps(export_eval_data, default=str),
+                    file_name=f"variant_eval_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json",
+                    key="export_imported_variant_eval"
+                )
+
+                # Per-variant details
+                for vname in variant_names:
+                    v_people = [pid for pid, v in person_variant_map.items() if v == vname]
+                    v_active = {
+                        pid: eval_results[pid] for pid in v_people
+                        if pid in eval_results and pid in responder_pids and pid not in variant_optout_ids
+                    }
+                    with st.expander(f"View {vname} - {len(v_active)} active responders"):
+                        detail_rows = []
+                        for pid, r in v_active.items():
+                            row = {'Person': get_person_name(pid, people_df) or f"Person {pid}"}
+                            for action in ACTION_TYPES:
+                                label = action.title()
+                                commit_data = r.get(f'{action}_commitment', {})
+                                follow_data = r.get(f'{action}_followthrough', {})
+                                row[f'{label} Commit'] = f"{commit_data.get('answer', 'N/A')} ({commit_data.get('confidence', 0)}%)"
+                                row[f'{label} Follow-through'] = f"{follow_data.get('answer', 'N/A')} ({follow_data.get('confidence', 0)}%)"
+                                if commit_data.get('answer') == 'YES' and commit_data.get('summary'):
+                                    row[f'{label} Commit'] += f" - {commit_data['summary']}"
+                                if follow_data.get('answer') == 'YES' and follow_data.get('summary'):
+                                    row[f'{label} Follow-through'] += f" - {follow_data['summary']}"
+                            detail_rows.append(row)
+                        if detail_rows:
+                            st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+                        else:
+                            st.caption("No active responders for this variant.")
+
+            elif 'message_variant_name' not in messages_df.columns:
                 st.info("No `message_variant_name` column found in Messages CSV. Add this column to outgoing messages to enable variant evaluation.")
             elif not use_llm_variant_eval or not llm_api_key:
                 st.info("Enable **AI variant evaluation** in the sidebar and configure an API key to use this feature.")
@@ -2044,6 +2251,33 @@ if messages_file and people_file:
                             hide_index=True,
                         )
 
+                        # Export results for sharing
+                        export_eval_data = {
+                            'eval_results': eval_results,
+                            'person_variant_map': {str(k): v for k, v in person_variant_map.items()},
+                            'responder_ids': [str(x) for x in st.session_state.get('variant_eval_responder_ids', set())],
+                            'optout_ids': [str(x) for x in st.session_state.get('variant_eval_optout_ids', set())],
+                            'metadata': {
+                                'timestamp': pd.Timestamp.now().isoformat(),
+                                'provider': llm_provider if llm_provider else 'imported',
+                                'n_conversations': len(eval_results),
+                            }
+                        }
+                        col_export, col_rerun = st.columns(2)
+                        with col_export:
+                            st.download_button(
+                                "⬇️ Export Variant Eval Results",
+                                data=json.dumps(export_eval_data, default=str),
+                                file_name=f"variant_eval_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.json",
+                                mime="application/json"
+                            )
+                        with col_rerun:
+                            if st.button("🔄 Re-run with AI", key="rerun_variant_eval"):
+                                for k in ['variant_eval_cache_key', 'variant_eval_results', 'variant_eval_aggregated',
+                                           'variant_eval_responder_ids', 'variant_eval_optout_ids']:
+                                    st.session_state.pop(k, None)
+                                st.rerun()
+
                         # Expandable per-variant details (active responders only)
                         display_responder_ids = st.session_state.get('variant_eval_responder_ids', set())
                         display_optout_ids = st.session_state.get('variant_eval_optout_ids', set())
@@ -2087,33 +2321,29 @@ if messages_file and people_file:
         st.info("Please ensure your CSV files have the expected column structure.")
 
 else:
-    st.info("👆 Please upload both Messages and People CSV files to begin analysis")
+    st.info("👆 Please upload Messages CSV file(s) and a People CSV file to begin analysis")
 
     with st.expander("Expected CSV Structure"):
         st.markdown("""
-        **Messages CSV should contain (Standard Format):**
-        - person_id
-        - body (message content)
-        - direction (incoming/outgoing)
-        - created_at or sent_at (timestamp)
-        - message_variant_name (optional, on outgoing messages - for variant evaluation)
+        **Messages CSV(s)** — upload one or more of these export types:
 
-        **Alternative Messages CSV Format:**
-        - conversation_id
-        - from (sender phone number)
-        - to (recipient phone number)
-        - body (message content)
-        - direction (incoming/outgoing)
-        - created_at (timestamp)
-        - phone_number_type (optional)
+        *Campaign Export:*
+        `id, conversation_id, message_variant_name, direction, body, from, to, created_at, ...`
+
+        *Flow Export:*
+        Same as Campaign, plus: `automation_id, automation_name, broadcast_id, broadcast_name, ...`
+
+        *All Messages Export:*
+        `id, conversation_id, direction, body, from, to, person_id, created_at, ...`
+
+        When multiple files are uploaded, they are merged by message `id`. This lets you
+        combine `message_variant_name` (from Campaign/Flow) with `person_id` (from All Messages).
 
         **People CSV should contain:**
         - id (person identifier)
         - phone/phone_number/mobile/cell (phone number)
         - name or first_name/last_name (optional)
-        - phone_number_type (optional)
-        - opted_out (boolean, optional)
         - tags (optional, comma-separated)
 
-        *Note: If using alternative message format, people records can be auto-generated from phone numbers.*
+        *Note: People records can be auto-generated from phone numbers when not in the people file.*
         """)
