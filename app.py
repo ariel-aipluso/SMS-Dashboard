@@ -73,12 +73,12 @@ st.markdown("*Interactive SMS Campaign Analysis Tool*")
 st.caption(f"Version: {get_version_date()}")
 
 # File upload section
-st.sidebar.header("📂 Data Upload")
-messages_files = st.sidebar.file_uploader(
-    "Upload Messages CSV(s)", type=['csv'], accept_multiple_files=True,
-    help="Upload one or more message exports (Campaign, Flow, All Messages). Files with the same message IDs will be merged."
-)
-people_file = st.sidebar.file_uploader("Upload People CSV", type=['csv'])
+with st.sidebar.expander("📂 Data Upload", expanded=True):
+    messages_files = st.file_uploader(
+        "Upload Messages CSV(s)", type=['csv'], accept_multiple_files=True,
+        help="Upload one or more message exports (Campaign, Flow, All Messages). Files with the same message IDs will be merged."
+    )
+    people_file = st.file_uploader("Upload People CSV", type=['csv'])
 
 def normalize_phone(phone):
     """Normalize phone number for comparison - handles floats, +1, formatting."""
@@ -2084,11 +2084,14 @@ if messages_files and people_file:
                 st.dataframe(variant_summary_df[display_cols], use_container_width=True, hide_index=True)
 
                 # Export re-share button
+                # Carry forward person_names from the imported data
+                _person_names = imported_data.get('person_names', {})
                 export_eval_data = {
                     'eval_results': eval_results,
                     'person_variant_map': {str(k): v for k, v in person_variant_map.items()},
                     'responder_ids': [str(x) for x in responder_pids],
                     'optout_ids': [str(x) for x in variant_optout_ids],
+                    'person_names': _person_names,
                     'metadata': {
                         'timestamp': pd.Timestamp.now().isoformat(),
                         'provider': meta.get('provider', 'imported'),
@@ -2104,6 +2107,7 @@ if messages_files and people_file:
                 )
 
                 # Per-variant details
+                _imported_names = imported_data.get('person_names', {})
                 for vname in variant_names:
                     v_people = [pid for pid, v in person_variant_map.items() if v == vname]
                     v_active = {
@@ -2113,7 +2117,7 @@ if messages_files and people_file:
                     with st.expander(f"View {vname} - {len(v_active)} active responders"):
                         detail_rows = []
                         for pid, r in v_active.items():
-                            row = {'Person': get_person_name(pid, people_df) or f"Person {pid}"}
+                            row = {'Person': _imported_names.get(str(pid)) or get_person_name(pid, people_df) or f"Person {pid}"}
                             for action in ACTION_TYPES:
                                 label = action.title()
                                 commit_data = r.get(f'{action}_commitment', {})
@@ -2251,12 +2255,18 @@ if messages_files and people_file:
                             hide_index=True,
                         )
 
-                        # Export results for sharing
+                        # Export results for sharing (include person names for standalone viewing)
+                        _person_names = {}
+                        for pid in person_variant_map:
+                            name = get_person_name(pid, people_df)
+                            if name:
+                                _person_names[str(pid)] = name
                         export_eval_data = {
                             'eval_results': eval_results,
                             'person_variant_map': {str(k): v for k, v in person_variant_map.items()},
                             'responder_ids': [str(x) for x in st.session_state.get('variant_eval_responder_ids', set())],
                             'optout_ids': [str(x) for x in st.session_state.get('variant_eval_optout_ids', set())],
+                            'person_names': _person_names,
                             'metadata': {
                                 'timestamp': pd.Timestamp.now().isoformat(),
                                 'provider': llm_provider if llm_provider else 'imported',
@@ -2321,29 +2331,98 @@ if messages_files and people_file:
         st.info("Please ensure your CSV files have the expected column structure.")
 
 else:
-    st.info("👆 Please upload Messages CSV file(s) and a People CSV file to begin analysis")
+    st.header("📊 Import Variant Evaluation Results")
+    st.caption("Have a results JSON from a previous run? Upload it here — no CSV files needed.")
+    json_only_file = st.file_uploader(
+        "Drop JSON file here", type=['json'],
+        key="json_only_import"
+    )
 
-    with st.expander("Expected CSV Structure"):
-        st.markdown("""
-        **Messages CSV(s)** — upload one or more of these export types:
+    if json_only_file:
+        try:
+            imported_data = json.loads(json_only_file.read())
+            eval_results = {k: v for k, v in imported_data['eval_results'].items()}
+            person_variant_map = imported_data['person_variant_map']
+            responder_pids = set(imported_data.get('responder_ids', []))
+            variant_optout_ids = set(imported_data.get('optout_ids', []))
+            variant_names = sorted(set(person_variant_map.values()))
 
-        *Campaign Export:*
-        `id, conversation_id, message_variant_name, direction, body, from, to, created_at, ...`
+            variant_summary_df = aggregate_variant_metrics(eval_results, person_variant_map, responder_pids, variant_optout_ids)
 
-        *Flow Export:*
-        Same as Campaign, plus: `automation_id, automation_name, broadcast_id, broadcast_name, ...`
+            meta = imported_data.get('metadata', {})
+            st.success(f"Loaded {meta.get('n_conversations', len(eval_results))} evaluation results (from {meta.get('timestamp', 'unknown')}, via {meta.get('provider', 'unknown')})")
 
-        *All Messages Export:*
-        `id, conversation_id, direction, body, from, to, person_id, created_at, ...`
+            # Display results
+            m1, m2, m3 = st.columns(3)
+            with m1:
+                st.metric("Variants", len(variant_names))
+            with m2:
+                st.metric("Conversations Evaluated", len(eval_results))
+            with m3:
+                avg_reply = variant_summary_df['_reply_rate'].mean()
+                st.metric("Avg Reply Rate", f"{avg_reply:.1f}%")
 
-        When multiple files are uploaded, they are merged by message `id`. This lets you
-        combine `message_variant_name` (from Campaign/Flow) with `person_id` (from All Messages).
+            display_cols = ['Variant', 'Total Recipients', 'Total Responders', 'Reply Rate', 'Opt-out Rate',
+                            'Active Responders',
+                            'Call Commit', 'Call Follow-through',
+                            'Letter Commit', 'Letter Follow-through',
+                            'Meeting Commit', 'Meeting Follow-through']
+            st.dataframe(variant_summary_df[display_cols], use_container_width=True, hide_index=True)
 
-        **People CSV should contain:**
-        - id (person identifier)
-        - phone/phone_number/mobile/cell (phone number)
-        - name or first_name/last_name (optional)
-        - tags (optional, comma-separated)
+            # Per-variant details
+            _standalone_names = imported_data.get('person_names', {})
+            for vname in variant_names:
+                v_people = [pid for pid, v in person_variant_map.items() if v == vname]
+                v_active = {
+                    pid: eval_results[pid] for pid in v_people
+                    if pid in eval_results and pid in responder_pids and pid not in variant_optout_ids
+                }
+                with st.expander(f"View {vname} - {len(v_active)} active responders"):
+                    detail_rows = []
+                    for pid, r in v_active.items():
+                        row = {'Person': _standalone_names.get(str(pid), f"Person {pid}")}
+                        for action in ACTION_TYPES:
+                            label = action.title()
+                            commit_data = r.get(f'{action}_commitment', {})
+                            follow_data = r.get(f'{action}_followthrough', {})
+                            row[f'{label} Commit'] = f"{commit_data.get('answer', 'N/A')} ({commit_data.get('confidence', 0)}%)"
+                            row[f'{label} Follow-through'] = f"{follow_data.get('answer', 'N/A')} ({follow_data.get('confidence', 0)}%)"
+                            if commit_data.get('answer') == 'YES' and commit_data.get('summary'):
+                                row[f'{label} Commit'] += f" - {commit_data['summary']}"
+                            if follow_data.get('answer') == 'YES' and follow_data.get('summary'):
+                                row[f'{label} Follow-through'] += f" - {follow_data['summary']}"
+                        detail_rows.append(row)
+                    if detail_rows:
+                        st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("No active responders for this variant.")
+        except Exception as e:
+            st.error(f"Error loading evaluation results: {e}")
+    if not json_only_file:
+        st.markdown("---")
+        st.header("📂 Upload Files for Your Own Analysis")
+        st.info("👆 Upload Messages CSV file(s) and a People CSV file in the sidebar to begin")
+        with st.expander("Expected CSV Structure"):
+            st.markdown("""
+            **Messages CSV(s)** — upload one or more of these export types:
 
-        *Note: People records can be auto-generated from phone numbers when not in the people file.*
-        """)
+            *Campaign Export:*
+            `id, conversation_id, message_variant_name, direction, body, from, to, created_at, ...`
+
+            *Flow Export:*
+            Same as Campaign, plus: `automation_id, automation_name, broadcast_id, broadcast_name, ...`
+
+            *All Messages Export:*
+            `id, conversation_id, direction, body, from, to, person_id, created_at, ...`
+
+            When multiple files are uploaded, they are merged by message `id`. This lets you
+            combine `message_variant_name` (from Campaign/Flow) with `person_id` (from All Messages).
+
+            **People CSV should contain:**
+            - id (person identifier)
+            - phone/phone_number/mobile/cell (phone number)
+            - name or first_name/last_name (optional)
+            - tags (optional, comma-separated)
+
+            *Note: People records can be auto-generated from phone numbers when not in the people file.*
+            """)
