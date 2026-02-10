@@ -795,6 +795,12 @@ if messages_files and people_file:
         people_chunks = pd.read_csv(people_file, chunksize=50000, low_memory=False)
         people_df = pd.concat(people_chunks, ignore_index=True)
 
+        # Drop unused columns to save memory (~80-90MB on large people files)
+        _keep_cols = {'id', 'first_name', 'last_name', 'name', 'tags',
+                      'sms_subscribed', 'sms_opt_out_at', 'sms_opt_out_reason',
+                      'phone', 'phone_number', 'mobile', 'cell'}
+        people_df = people_df[[c for c in people_df.columns if c in _keep_cols]]
+
         # Parse tags early for exclusion filter
         excluded_tags = []
         if 'tags' in people_df.columns:
