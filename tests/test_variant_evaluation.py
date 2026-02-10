@@ -291,8 +291,8 @@ class TestAggregateVariantMetrics:
         }
         person_variant_map = {1: 'V1', 2: 'V1', 3: 'V1', 4: 'V1'}
         df = aggregate_variant_metrics(eval_results, person_variant_map, {1, 2}, {2})
-        # Reply rate: 1/4 = 25% (person 1 replied, person 2 opted out)
-        assert df.iloc[0]['_reply_rate'] == 25.0
+        # Reply rate: 2/4 = 50% (all responders regardless of opt-out)
+        assert df.iloc[0]['_reply_rate'] == 50.0
         # Opt-out rate: 1/4 = 25%
         assert df.iloc[0]['_optout_rate'] == 25.0
 

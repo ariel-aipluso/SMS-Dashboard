@@ -622,11 +622,11 @@ def aggregate_variant_metrics(eval_results: dict, person_variant_map: dict, resp
             'Variant': variant_name,
             'Total Recipients': recipients,
             'Total Responders': d['responders'],
-            'Reply Rate': _fmt(d['reply'], recipients),
+            'Reply Rate': _fmt(d['responders'], recipients),
             'Opt-out Rate': _fmt(d['optout'], recipients),
             'Active Responders': _fmt(active, recipients),
             'Median Active Responses': median_replies,
-            '_reply_rate': _rate(d['reply'], recipients),
+            '_reply_rate': _rate(d['responders'], recipients),
             '_optout_rate': _rate(d['optout'], recipients),
             '_active_responders_rate': _rate(active, recipients),
         }
