@@ -2,27 +2,17 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
 from datetime import datetime, timedelta
+import importlib.util
 import re
 import os
 import json
-import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Optional: LLM providers for AI-based verification
-try:
-    import anthropic
-    ANTHROPIC_AVAILABLE = True
-except ImportError:
-    ANTHROPIC_AVAILABLE = False
-
-try:
-    import openai
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
+# Check LLM availability without importing (saves ~100-150MB on idle)
+ANTHROPIC_AVAILABLE = importlib.util.find_spec("anthropic") is not None
+OPENAI_AVAILABLE = importlib.util.find_spec("openai") is not None
 
 
 def get_centralized_api_key(provider: str) -> str | None:
@@ -52,14 +42,16 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+@st.cache_resource
 def get_version_date():
     """Get the last git commit date for version display."""
+    import subprocess
     try:
-        # Get the last commit date in a readable format
         result = subprocess.run(
             ['git', 'log', '-1', '--format=%cd', '--date=format:%B %d, %Y'],
             capture_output=True,
             text=True,
+            timeout=5,
             cwd=os.path.dirname(os.path.abspath(__file__))
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -280,6 +272,7 @@ def analyze_commitments_with_anthropic(conversations: dict, api_key: str, custom
     if not ANTHROPIC_AVAILABLE or not api_key:
         return {}
 
+    import anthropic
     client = anthropic.Anthropic(api_key=api_key)
     results = {}
     prompt_template = custom_prompt if custom_prompt else DEFAULT_COMMITMENT_PROMPT
@@ -339,6 +332,7 @@ def analyze_commitments_with_openai(conversations: dict, api_key: str, custom_pr
     if not OPENAI_AVAILABLE or not api_key:
         return {}
 
+    import openai
     client = openai.OpenAI(api_key=api_key)
     results = {}
     prompt_template = custom_prompt if custom_prompt else DEFAULT_COMMITMENT_PROMPT
@@ -456,6 +450,7 @@ def analyze_variant_eval_with_anthropic(conversations: dict, api_key: str, custo
     if not ANTHROPIC_AVAILABLE or not api_key:
         return {}
 
+    import anthropic
     client = anthropic.Anthropic(api_key=api_key)
     prompt_template = custom_prompt if custom_prompt else DEFAULT_VARIANT_EVAL_PROMPT
 
@@ -500,6 +495,7 @@ def analyze_variant_eval_with_openai(conversations: dict, api_key: str, custom_p
     if not OPENAI_AVAILABLE or not api_key:
         return {}
 
+    import openai
     client = openai.OpenAI(api_key=api_key)
     prompt_template = custom_prompt if custom_prompt else DEFAULT_VARIANT_EVAL_PROMPT
 
