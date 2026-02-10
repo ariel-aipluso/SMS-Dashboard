@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
 from datetime import datetime, timedelta
 import importlib.util
 import re
@@ -1152,25 +1151,23 @@ if messages_files and people_file:
 
             with col1:
                 # Engagement depth chart
-                fig = px.bar(
-                    x=list(engagement_buckets.keys()),
-                    y=list(engagement_buckets.values()),
-                    title="Response Engagement Levels",
-                    labels={'x': 'Engagement Level', 'y': 'Number of People'}
-                )
-                st.plotly_chart(fig, width='stretch')
+                st.subheader("Response Engagement Levels")
+                chart_df = pd.DataFrame({
+                    'Engagement Level': list(engagement_buckets.keys()),
+                    'Number of People': list(engagement_buckets.values())
+                }).set_index('Engagement Level')
+                st.bar_chart(chart_df)
 
             with col2:
                 # Response distribution
                 if not person_response_counts.empty:
-                    fig = px.histogram(
-                        person_response_counts,
-                        x='response_count',
-                        nbins=int(min(20, person_response_counts['response_count'].max())),
-                        title="Distribution of Response Counts",
-                        labels={'response_count': 'Number of Responses', 'count': 'Number of People'}
-                    )
-                    st.plotly_chart(fig, width='stretch')
+                    st.subheader("Distribution of Response Counts")
+                    hist_data = person_response_counts['response_count'].value_counts().sort_index()
+                    hist_df = pd.DataFrame({
+                        'Number of People': hist_data.values
+                    }, index=hist_data.index)
+                    hist_df.index.name = 'Number of Responses'
+                    st.bar_chart(hist_df)
 
             # Opt-out timing analysis
             st.header("⏰ Opt-out Timing Analysis")
@@ -1255,17 +1252,12 @@ if messages_files and people_file:
                         col1, col2 = st.columns(2)
 
                         with col1:
-                            colors = {'Opt-out only': '#EF553B', 'Replied before opting out': '#636EFA'}
-                            fig = px.bar(
-                                x=category_counts.index,
-                                y=category_counts.values,
-                                title="Opt-out Breakdown by Engagement",
-                                labels={'x': 'Engagement Type', 'y': 'Number of Opt-outs'},
-                                color=category_counts.index,
-                                color_discrete_map=colors
-                            )
-                            fig.update_layout(showlegend=False)
-                            st.plotly_chart(fig, width='stretch')
+                            st.subheader("Opt-out Breakdown by Engagement")
+                            optout_chart_df = pd.DataFrame({
+                                'Number of Opt-outs': category_counts.values
+                            }, index=category_counts.index)
+                            optout_chart_df.index.name = 'Engagement Type'
+                            st.bar_chart(optout_chart_df)
 
                         with col2:
                             st.subheader("Key Insights")
