@@ -148,14 +148,16 @@ class TestGetPersonVariant:
         # Person 5 has empty variant, should not be in map
         assert 5 not in result
 
-    def test_empty_variants_excluded(self):
+    def test_empty_variants_assigned_to_all(self):
+        """When all variant names are empty/None, assign everyone to 'All'."""
         df = pd.DataFrame([
             {'person_id': 1, 'direction': 'outgoing', 'body': 'Hi', 'created_at': '2026-01-01', 'message_variant_name': ''},
             {'person_id': 2, 'direction': 'outgoing', 'body': 'Hi', 'created_at': '2026-01-01', 'message_variant_name': None},
         ])
         df['created_at'] = pd.to_datetime(df['created_at'])
         result = get_person_variant(df)
-        assert len(result) == 0
+        assert len(result) == 2
+        assert all(v == 'All' for v in result.values())
 
     def test_first_outgoing_message_used(self):
         df = pd.DataFrame([

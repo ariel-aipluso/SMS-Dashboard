@@ -201,22 +201,6 @@ def format_conversation_for_llm(person_messages_df):
 PROMPT_VERSION = "v19"  # Increment this when changing the prompt to bust cache
 
 # Default prompts for AI verification
-DEFAULT_OPTOUT_PROMPT = """Look at this SMS conversation. Did the person (THEM) send "STOP" to unsubscribe?
-
-Answer YES only if THEM sent a standalone message like:
-- "STOP", "Stop", "stop" (by itself)
-- "STOP!" or "Stop."
-
-Answer NO if:
-- "stop" appears inside a longer sentence (e.g., "stop spreading bull", "stop by later")
-- They're having a conversation, even if frustrated
-- They said "Over and out" or similar (not STOP)
-
-CONVERSATION:
-{conversation}
-
-Reply with ONLY one word: YES or NO"""
-
 DEFAULT_COMMITMENT_PROMPT = """Did THEM agree to take an action they were asked to do?
 
 Actions include: making a call, attending an event, gathering others.
@@ -287,70 +271,6 @@ LETTER_COMMITMENT: NO 95 - No letter or email was requested in the conversation.
 LETTER_FOLLOWTHROUGH: NO 99 - No letter commitment was made.
 MEETING_COMMITMENT: YES 88 - THEM agreed to attend the rally after being asked.
 MEETING_FOLLOWTHROUGH: NO 90 - THEM committed to attend but never reported going."""
-
-def analyze_conversations_with_anthropic(conversations: dict, api_key: str, custom_prompt: str = None) -> dict:
-    """
-    Use Claude to analyze conversations INDIVIDUALLY and detect opt-outs.
-    """
-    if not ANTHROPIC_AVAILABLE or not api_key:
-        return {}
-
-    client = anthropic.Anthropic(api_key=api_key)
-    results = {}
-
-    prompt_template = custom_prompt if custom_prompt else DEFAULT_OPTOUT_PROMPT
-
-    for person_id, conversation in conversations.items():
-        prompt = prompt_template.format(conversation=conversation)
-
-        try:
-            response = client.messages.create(
-                model="claude-3-5-haiku-20241022",
-                max_tokens=10,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            response_text = response.content[0].text.strip().upper()
-            opted_out = response_text.startswith("YES")
-            results[person_id] = {"opted_out": opted_out, "opt_out_message": None}
-
-        except Exception as e:
-            st.warning(f"Anthropic API error for {person_id}: {e}")
-            results[person_id] = {"opted_out": "unknown", "opt_out_message": None, "error": str(e)}
-
-    return results
-
-def analyze_conversations_with_openai(conversations: dict, api_key: str, custom_prompt: str = None) -> dict:
-    """
-    Use OpenAI to analyze conversations INDIVIDUALLY and detect opt-outs.
-    """
-    if not OPENAI_AVAILABLE or not api_key:
-        return {}
-
-    client = openai.OpenAI(api_key=api_key)
-    results = {}
-
-    # Use custom prompt or default
-    prompt_template = custom_prompt if custom_prompt else DEFAULT_OPTOUT_PROMPT
-
-    for person_id, conversation in conversations.items():
-        prompt = prompt_template.format(conversation=conversation)
-
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                max_tokens=10,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            response_text = response.choices[0].message.content.strip().upper()
-            opted_out = response_text.startswith("YES")
-
-            results[person_id] = {"opted_out": opted_out, "opt_out_message": None}
-
-        except Exception as e:
-            st.warning(f"OpenAI API error for {person_id}: {e}")
-            results[person_id] = {"opted_out": "unknown", "opt_out_message": None, "error": str(e)}
-
-    return results
 
 # Commitment analysis functions
 def analyze_commitments_with_anthropic(conversations: dict, api_key: str, custom_prompt: str = None, progress_callback=None) -> dict:
@@ -620,9 +540,23 @@ def analyze_variant_eval_with_openai(conversations: dict, api_key: str, custom_p
     return results
 
 def get_person_variant(messages_df):
-    """Map person_id -> message_variant_name from initial broadcast messages only."""
+    """Map person_id -> message_variant_name from initial broadcast messages only.
+    If message_variant_name column is missing, assigns all recipients to 'All'."""
+    # Base filter: outgoing, exclude undelivered/failed messages
+    base_mask = messages_df['direction'] == 'outgoing'
+    if 'status' in messages_df.columns:
+        base_mask = base_mask & (~messages_df['status'].fillna('').str.lower().isin(['undelivered', 'failed']))
+
+    if 'message_variant_name' not in messages_df.columns or messages_df['message_variant_name'].dropna().astype(str).str.strip().replace('', pd.NA).dropna().empty:
+        # No variant info — assign all outgoing-message recipients to a single group
+        outgoing = messages_df[base_mask]
+        if 'message_node_name' in outgoing.columns:
+            outgoing = outgoing[outgoing['message_node_name'].isna() | (outgoing['message_node_name'].astype(str).str.strip() == '')]
+        person_ids = outgoing['person_id'].dropna().unique()
+        return {pid: 'All' for pid in person_ids}
+
     mask = (
-        (messages_df['direction'] == 'outgoing') &
+        base_mask &
         (messages_df['message_variant_name'].notna()) &
         (messages_df['message_variant_name'].astype(str).str.strip() != '')
     )
@@ -634,12 +568,14 @@ def get_person_variant(messages_df):
 
 ACTION_TYPES = ['call', 'letter', 'meeting']
 
-def aggregate_variant_metrics(eval_results: dict, person_variant_map: dict, responder_ids: set, optout_ids: set) -> pd.DataFrame:
+def aggregate_variant_metrics(eval_results: dict, person_variant_map: dict, responder_ids: set, optout_ids: set, person_reply_counts: dict = None) -> pd.DataFrame:
     """Aggregate per-conversation LLM evaluation results by variant into a summary DataFrame."""
     OTHER_THRESHOLD = 85
+    if person_reply_counts is None:
+        person_reply_counts = {}
 
     def _empty_counters():
-        d = {'recipients': 0, 'responders': 0, 'reply': 0, 'optout': 0}
+        d = {'recipients': 0, 'responders': 0, 'reply': 0, 'optout': 0, 'active_reply_counts': []}
         for action in ACTION_TYPES:
             d[f'{action}_commitment'] = 0
             d[f'{action}_followthrough'] = 0
@@ -651,12 +587,16 @@ def aggregate_variant_metrics(eval_results: dict, person_variant_map: dict, resp
             variant_data[variant_name] = _empty_counters()
         # Everyone in person_variant_map received an outgoing message with this variant
         variant_data[variant_name]['recipients'] += 1
+        if person_id in optout_ids:
+            variant_data[variant_name]['optout'] += 1
         if person_id in responder_ids:
             variant_data[variant_name]['responders'] += 1
-            if person_id in optout_ids:
-                variant_data[variant_name]['optout'] += 1
-            else:
+            if person_id not in optout_ids:
                 variant_data[variant_name]['reply'] += 1
+                # Track reply counts for active responders (not opted out)
+                count = person_reply_counts.get(person_id) or person_reply_counts.get(str(person_id), 0)
+                if count > 0:
+                    variant_data[variant_name]['active_reply_counts'].append(count)
 
         if person_id in eval_results:
             r = eval_results[person_id]
@@ -675,7 +615,9 @@ def aggregate_variant_metrics(eval_results: dict, person_variant_map: dict, resp
     rows = []
     for variant_name, d in sorted(variant_data.items()):
         recipients = d['recipients']
-        active = d['responders'] - d['optout']
+        active = d['reply']  # responders who have not opted out
+        active_counts = d['active_reply_counts']
+        median_replies = float(np.median(active_counts)) if active_counts else 0.0
         row = {
             'Variant': variant_name,
             'Total Recipients': recipients,
@@ -683,6 +625,7 @@ def aggregate_variant_metrics(eval_results: dict, person_variant_map: dict, resp
             'Reply Rate': _fmt(d['reply'], recipients),
             'Opt-out Rate': _fmt(d['optout'], recipients),
             'Active Responders': _fmt(active, recipients),
+            'Median Active Responses': median_replies,
             '_reply_rate': _rate(d['reply'], recipients),
             '_optout_rate': _rate(d['optout'], recipients),
             '_active_responders_rate': _rate(active, recipients),
@@ -697,91 +640,6 @@ def aggregate_variant_metrics(eval_results: dict, person_variant_map: dict, resp
         rows.append(row)
 
     return pd.DataFrame(rows) if rows else pd.DataFrame()
-
-def detect_optouts(messages_df, use_llm=False, llm_provider=None, api_key=None, custom_prompt=None):
-    """
-    Detect opt-out messages using keyword matching and optionally LLM verification.
-    LLM is only used to verify keyword-detected opt-outs (cost optimization).
-    """
-    stop_keywords = ['stop', 'unsubscribe', 'opt out', 'opt-out', 'remove', 'quit', 'cancel',
-                     'stopall', 'end', 'revoke', 'optout']
-
-    incoming_messages = messages_df[messages_df['direction'] == 'incoming'].copy()
-
-    # Match standalone keywords only (entire message is just the keyword, ignoring case/whitespace/punctuation)
-    incoming_messages['_body_stripped'] = incoming_messages['body'].fillna('').str.lower().str.strip().str.replace(r'[^\w\s-]', '', regex=True).str.strip()
-    incoming_messages['is_stop_keyword'] = incoming_messages['_body_stripped'].isin(stop_keywords)
-    incoming_messages.drop(columns=['_body_stripped'], inplace=True)
-
-    incoming_messages['is_stop_llm_verified'] = False
-    incoming_messages['is_ai_rejected'] = False  # Track false positives
-    incoming_messages['detection_method'] = None
-
-    # Get people flagged by keyword matching
-    keyword_opted_out_people = set(incoming_messages[incoming_messages['is_stop_keyword']]['person_id'].unique())
-
-    if use_llm and llm_provider and api_key and keyword_opted_out_people:
-        # Only analyze conversations that were flagged by keywords (cost optimization)
-        conversations = {}
-        for person_id in keyword_opted_out_people:
-            person_msgs = messages_df[messages_df['person_id'] == person_id].sort_values('created_at')
-            conversations[person_id] = format_conversation_for_llm(person_msgs)
-
-        provider_name = "Claude" if llm_provider == "anthropic" else "GPT-4o-mini"
-        with st.spinner(f"Verifying {len(conversations)} keyword-flagged conversations with {provider_name}..."):
-            if llm_provider == "anthropic":
-                llm_results = analyze_conversations_with_anthropic(conversations, api_key, custom_prompt)
-            else:
-                llm_results = analyze_conversations_with_openai(conversations, api_key, custom_prompt)
-
-        # LLM verification: confirm or reject keyword matches
-        verified_count = 0
-        rejected_count = 0
-
-        # Process ALL keyword-flagged people, not just those in llm_results
-        unknown_count = 0
-        for person_id in keyword_opted_out_people:
-            person_incoming = incoming_messages[incoming_messages['person_id'] == person_id]
-            keyword_flagged_msgs = person_incoming[person_incoming['is_stop_keyword']]
-
-            # Get LLM result, default to "unknown" if not found
-            result = llm_results.get(person_id, {"opted_out": "unknown", "opt_out_message": None})
-            opted_out_status = result.get('opted_out')
-
-            if opted_out_status == "unknown":
-                # API error - keep keyword match but mark as unverified
-                for idx in keyword_flagged_msgs.index:
-                    incoming_messages.loc[idx, 'is_stop_llm_unknown'] = True
-                unknown_count += 1
-            elif opted_out_status:
-                # LLM confirms this is a real opt-out
-                for idx in keyword_flagged_msgs.index:
-                    incoming_messages.loc[idx, 'is_stop_llm_verified'] = True
-                verified_count += 1
-            else:
-                # LLM says this is NOT an opt-out (false positive from keywords)
-                for idx in keyword_flagged_msgs.index:
-                    incoming_messages.loc[idx, 'is_stop_keyword'] = False
-                    incoming_messages.loc[idx, 'is_ai_rejected'] = True  # Mark as rejected
-                rejected_count += 1
-
-        if verified_count > 0:
-            st.success(f"🤖 AI verified {verified_count} opt-out(s)")
-        if rejected_count > 0:
-            st.info(f"🤖 AI rejected {rejected_count} false positive(s) from keyword matching")
-        if unknown_count > 0:
-            st.warning(f"⚠️ {unknown_count} conversation(s) could not be analyzed (API error) - kept as keyword match")
-
-    # Final opt-out status
-    incoming_messages['is_stop'] = incoming_messages['is_stop_keyword']
-    incoming_messages['detection_method'] = incoming_messages.apply(
-        lambda row: 'AI Rejected' if row.get('is_ai_rejected', False)
-                   else ('AI Verified' if row.get('is_stop_llm_verified', False)
-                   else ('AI Unknown' if row.get('is_stop_llm_unknown', False)
-                   else ('Keyword' if row['is_stop_keyword'] else None))), axis=1
-    )
-
-    return incoming_messages
 
 # Sidebar: Date Filter (available before data upload)
 st.sidebar.markdown("---")
@@ -809,7 +667,6 @@ elif date_filter_type == "Date range":
 # Sidebar: LLM Configuration
 st.sidebar.markdown("---")
 st.sidebar.header("🤖 AI Verification")
-use_llm_optout = False
 use_llm_commitment = False
 use_llm_variant_eval = False
 llm_provider = None
@@ -817,10 +674,6 @@ llm_api_key = None
 
 if ANTHROPIC_AVAILABLE or OPENAI_AVAILABLE:
     st.sidebar.caption("Select which features to enable:")
-    use_llm_optout = st.sidebar.checkbox(
-        "AI opt-out detection",
-        help="Uses AI to verify opt-out keyword matches"
-    )
     use_llm_commitment = st.sidebar.checkbox(
         "AI commitment verification",
         value=False,
@@ -832,7 +685,7 @@ if ANTHROPIC_AVAILABLE or OPENAI_AVAILABLE:
         help="Uses AI to evaluate reply, opt-out, commitment, and follow-through per conversation grouped by message variant"
     )
 
-    if use_llm_optout or use_llm_commitment or use_llm_variant_eval:
+    if use_llm_commitment or use_llm_variant_eval:
         # Check for centralized API keys
         centralized_anthropic = get_centralized_api_key("anthropic") if ANTHROPIC_AVAILABLE else None
         centralized_openai = get_centralized_api_key("openai") if OPENAI_AVAILABLE else None
@@ -896,13 +749,11 @@ if ANTHROPIC_AVAILABLE or OPENAI_AVAILABLE:
             llm_api_key = centralized_openai
         else:
             st.sidebar.warning("Enter an API key to enable AI verification")
-            use_llm_optout = False
             use_llm_commitment = False
             use_llm_variant_eval = False
 
         # Auto-reset prompts when PROMPT_VERSION changes
         if st.session_state.get('prompt_version') != PROMPT_VERSION:
-            st.session_state['custom_optout_prompt'] = DEFAULT_OPTOUT_PROMPT
             st.session_state['custom_commitment_prompt'] = DEFAULT_COMMITMENT_PROMPT
             st.session_state['custom_variant_eval_prompt'] = DEFAULT_VARIANT_EVAL_PROMPT
             st.session_state['prompt_version'] = PROMPT_VERSION
@@ -910,15 +761,6 @@ if ANTHROPIC_AVAILABLE or OPENAI_AVAILABLE:
         # Editable prompts section
         with st.sidebar.expander("✏️ Customize AI Prompts"):
             st.caption("Edit the prompts used for AI verification. Use {conversation} as placeholder for the conversation text.")
-
-            custom_optout_prompt = st.text_area(
-                "Opt-out Detection Prompt",
-                value=st.session_state.get('custom_optout_prompt', DEFAULT_OPTOUT_PROMPT),
-                height=200,
-                key="optout_prompt_input",
-                help="Prompt used to verify opt-out messages"
-            )
-            st.session_state['custom_optout_prompt'] = custom_optout_prompt
 
             custom_commitment_prompt = st.text_area(
                 "Commitment Verification Prompt",
@@ -939,7 +781,6 @@ if ANTHROPIC_AVAILABLE or OPENAI_AVAILABLE:
             st.session_state['custom_variant_eval_prompt'] = custom_variant_eval_prompt
 
             if st.button("Reset to Defaults", key="reset_prompts"):
-                st.session_state['custom_optout_prompt'] = DEFAULT_OPTOUT_PROMPT
                 st.session_state['custom_commitment_prompt'] = DEFAULT_COMMITMENT_PROMPT
                 st.session_state['custom_variant_eval_prompt'] = DEFAULT_VARIANT_EVAL_PROMPT
                 st.rerun()
@@ -947,7 +788,6 @@ else:
     st.sidebar.info("Install `anthropic` or `openai` package to enable AI verification")
 
 # Get prompts (use defaults if not customized)
-optout_prompt_template = st.session_state.get('custom_optout_prompt', DEFAULT_OPTOUT_PROMPT)
 commitment_prompt_template = st.session_state.get('custom_commitment_prompt', DEFAULT_COMMITMENT_PROMPT)
 variant_eval_prompt_template = st.session_state.get('custom_variant_eval_prompt', DEFAULT_VARIANT_EVAL_PROMPT)
 
@@ -1215,58 +1055,72 @@ if messages_files and people_file:
             # Data overview
             st.header("📊 Campaign Summary")
 
-            col1, col2, col3, col4, col5 = st.columns(5)
+            col1, col2, col3, col4 = st.columns(4)
 
             # Total recipients = people who received an outgoing message in this campaign
-            outgoing_person_ids = set(messages_df[messages_df['direction'] == 'outgoing']['person_id'].unique())
+            # Exclude undelivered/failed messages — these were never received
+            outgoing_mask = messages_df['direction'] == 'outgoing'
+            if 'status' in messages_df.columns:
+                outgoing_mask = outgoing_mask & (~messages_df['status'].fillna('').str.lower().isin(['undelivered', 'failed']))
+            outgoing_person_ids = set(messages_df[outgoing_mask]['person_id'].unique())
             total_recipients = len(outgoing_person_ids)
 
-            # Calculate opt-outs first (standalone keyword matching)
-            stop_keywords = ['stop', 'unsubscribe', 'opt out', 'opt-out', 'remove', 'quit', 'cancel',
-                             'stopall', 'end', 'revoke', 'optout']
-            opted_out_people_set = set()
+            # Determine broadcast time (first outgoing message) for opt-out scoping
+            outgoing_msgs = messages_df[outgoing_mask]
+            broadcast_time = pd.to_datetime(outgoing_msgs['created_at'].min()) if not outgoing_msgs.empty else None
 
-            if 'body' in messages_df.columns:
+            # Calculate opt-outs AFTER broadcast from people file, or keyword fallback
+            opted_out_people_set = set()
+            optout_source = "keyword"
+            if not people_df.empty and 'sms_subscribed' in people_df.columns and 'sms_opt_out_at' in people_df.columns and broadcast_time is not None:
+                # Only count people who opted out AFTER the broadcast was sent
+                people_with_optout = people_df[
+                    (people_df['sms_subscribed'] == False) &
+                    (people_df['sms_opt_out_at'].notna())
+                ].copy()
+                people_with_optout['_opt_out_at'] = pd.to_datetime(people_with_optout['sms_opt_out_at'], errors='coerce')
+                opted_out_after = set(people_with_optout[people_with_optout['_opt_out_at'] > broadcast_time]['id'])
+                opted_out_people_set = opted_out_after & outgoing_person_ids
+                optout_source = "people_file"
+            elif not people_df.empty and 'sms_subscribed' in people_df.columns:
+                # No opt_out_at column — fall back to all unsubscribed recipients
+                opted_out_people_set = set(people_df[people_df['sms_subscribed'] == False]['id']) & outgoing_person_ids
+                optout_source = "people_file"
+            elif 'body' in messages_df.columns:
+                stop_keywords = ['stop', 'unsubscribe', 'opt out', 'opt-out', 'remove', 'quit', 'cancel',
+                                 'stopall', 'end', 'revoke', 'optout']
                 incoming_msgs = messages_df[messages_df['direction'] == 'incoming'].copy()
                 body_stripped = incoming_msgs['body'].fillna('').str.lower().str.strip().str.replace(r'[^\w\s-]', '', regex=True).str.strip()
-                incoming_stop_messages = incoming_msgs[body_stripped.isin(stop_keywords)]
-                opted_out_people_set = set(incoming_stop_messages['person_id'].unique())
-                opt_outs = len(opted_out_people_set)
-            else:
-                opt_outs = 0
+                opted_out_people_set = set(incoming_msgs[body_stripped.isin(stop_keywords)]['person_id'].unique())
+            opt_outs = len(opted_out_people_set)
 
             # Calculate responders from incoming messages
             all_responders = set(messages_df[messages_df['direction'] == 'incoming']['person_id'].unique())
             total_responders = len(all_responders)
 
-            # Calculate active responders (responded but didn't opt out)
-            active_responders_set = all_responders - opted_out_people_set
-            active_responders = len(active_responders_set)
-
-            # Non-opted-out recipients (for active response rate denominator)
-            non_opted_out_recipients = total_recipients - opt_outs
-
-            # Total Response Rate: all responders / all recipients
+            # Total Response Rate: people who replied 1+ times / total recipients
             total_response_rate = (total_responders / total_recipients * 100) if total_recipients > 0 else 0
 
-            # Active Response Rate: active responders / non-opted-out recipients
-            active_response_rate = (active_responders / non_opted_out_recipients * 100) if non_opted_out_recipients > 0 else 0
+            # Active responders: replied AND not opted out after broadcast
+            active_responders_set = all_responders - opted_out_people_set
+            active_responders = len(active_responders_set)
+            active_responder_pct = (active_responders / total_recipients * 100) if total_recipients > 0 else 0
 
             with col1:
                 st.metric("Total Recipients", f"{total_recipients:,}")
-                if not people_df.empty:
-                    st.caption(f"People file: {len(people_df):,}")
             with col2:
                 st.metric("Total Response Rate", f"{total_response_rate:.1f}%")
-                st.caption(f"All responders / {total_recipients:,} recipients")
+                st.caption(f"{total_responders:,} replied / {total_recipients:,} recipients")
             with col3:
-                st.metric("Active Response Rate", f"{active_response_rate:.1f}%")
-                st.caption(f"Active / {non_opted_out_recipients:,} non-opted-out")
+                st.metric("Active Responders", f"{active_responders:,} ({active_responder_pct:.1f}%)")
+                st.caption("Responders who have not opted out")
             with col4:
-                st.metric("Total Responders", f"{total_responders:,}")
-                st.caption(f"Active: {active_responders:,}")
-            with col5:
-                st.metric("Opt-outs", f"{opt_outs:,}")
+                optout_pct = (opt_outs / total_recipients * 100) if total_recipients > 0 else 0
+                st.metric("Opt-outs", f"{opt_outs:,} ({optout_pct:.1f}%)")
+                if optout_source == "people_file":
+                    st.caption("Opted out after broadcast")
+                else:
+                    st.caption("STOP keyword matches")
 
             # Engagement depth analysis
             st.header("📈 Engagement Depth Analysis")
@@ -1312,211 +1166,149 @@ if messages_files and people_file:
 
             # Opt-out timing analysis
             st.header("⏰ Opt-out Timing Analysis")
-            detection_method = "AI + keyword matching" if use_llm_optout else "keyword matching"
-            st.caption(f"Analyzing opt-outs by engagement level ({detection_method})")
 
-            if 'body' in messages_df.columns:
-                # Create cache key for opt-out detection
-                optout_cache_key = f"optout_{len(messages_df)}_{use_llm_optout}_{llm_provider}_{hash(optout_prompt_template)}"
+            if opted_out_people_set:
+                # Stop keywords to identify opt-out-only replies vs substantive conversation
+                _stop_keywords = {'stop', 'unsubscribe', 'opt out', 'opt-out', 'remove', 'quit', 'cancel',
+                                  'stopall', 'end', 'revoke', 'optout'}
 
-                # Use cached results if available
-                if 'optout_cache_key' in st.session_state and st.session_state.get('optout_cache_key') == optout_cache_key:
-                    incoming_messages = st.session_state['optout_results']
-                else:
-                    # Detect opt-outs using keyword matching or LLM
-                    incoming_messages = detect_optouts(messages_df, use_llm=use_llm_optout, llm_provider=llm_provider, api_key=llm_api_key, custom_prompt=optout_prompt_template)
-                    st.session_state['optout_cache_key'] = optout_cache_key
-                    st.session_state['optout_results'] = incoming_messages
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Total Opt-outs", f"{opt_outs:,}")
+                    st.caption(f"Of {total_recipients:,} total recipients")
+                with col2:
+                    optout_rate = (opt_outs / total_recipients * 100) if total_recipients > 0 else 0
+                    st.metric("Opt-out Rate", f"{optout_rate:.1f}%")
+                    st.caption("% of recipients who opted out after broadcast")
 
-                stop_messages = incoming_messages[incoming_messages['is_stop']]
-                opted_out_people = stop_messages['person_id'].unique().tolist()
+                # Classify ALL opted-out people by engagement
+                opt_out_categories = []
+                opt_out_details = []
 
-                # Get AI-rejected false positives for display
-                ai_rejected_messages = incoming_messages[incoming_messages['is_ai_rejected'] == True] if 'is_ai_rejected' in incoming_messages.columns else pd.DataFrame()
-                ai_rejected_people = ai_rejected_messages['person_id'].unique().tolist() if not ai_rejected_messages.empty else []
+                # Build people lookup for opt-out reason/timestamp
+                _people_optout_lookup = {}
+                if not people_df.empty and 'sms_opt_out_reason' in people_df.columns:
+                    for _, row in people_df[people_df['id'].isin(opted_out_people_set)].iterrows():
+                        _people_optout_lookup[row['id']] = {
+                            'reason': row.get('sms_opt_out_reason', ''),
+                            'opt_out_at': pd.to_datetime(row.get('sms_opt_out_at'), errors='coerce')
+                        }
 
-                if opted_out_people or ai_rejected_people:
-                    # Summary stats first (matching committed responders format)
-                    if ai_rejected_people:
-                        col1, col2, col3 = st.columns(3)
-                    else:
+                for person_id in opted_out_people_set:
+                    person_messages = messages_df[messages_df['person_id'] == person_id].sort_values('created_at')
+                    person_incoming = person_messages[person_messages['direction'] == 'incoming']
+
+                    optout_info = _people_optout_lookup.get(person_id, {})
+                    opt_out_time = optout_info.get('opt_out_at')
+                    opt_out_reason = optout_info.get('reason', '')
+                    if pd.isna(opt_out_reason):
+                        opt_out_reason = ''
+
+                    num_replies = len(person_incoming)
+                    bot_messages = len(person_messages[person_messages['direction'] == 'outgoing'])
+
+                    # Classify: check if any incoming messages are substantive (not just stop keywords)
+                    has_substantive_reply = False
+                    if num_replies > 0:
+                        for _, msg in person_incoming.iterrows():
+                            body = str(msg.get('body', '') or '').strip()
+                            body_normalized = body.lower().strip()
+                            # Remove punctuation for keyword comparison
+                            body_clean = pd.Series([body_normalized]).str.replace(r'[^\w\s-]', '', regex=True).str.strip().iloc[0]
+                            if body_clean and body_clean not in _stop_keywords:
+                                has_substantive_reply = True
+                                break
+
+                    engagement_category = "Replied before opting out" if has_substantive_reply else "Opt-out only"
+
+                    # Calculate hours from first outgoing to opt-out
+                    first_bot_msg = person_messages[person_messages['direction'] == 'outgoing']
+                    hours = None
+                    if len(first_bot_msg) > 0 and pd.notna(opt_out_time):
+                        first_bot_time = first_bot_msg.iloc[0]['created_at']
+                        if pd.notna(first_bot_time):
+                            hours = (opt_out_time - first_bot_time).total_seconds() / 3600
+
+                    opt_out_categories.append(engagement_category)
+                    opt_out_details.append({
+                        'person_id': person_id,
+                        'engagement_category': engagement_category,
+                        'replies': num_replies,
+                        'bot_messages': bot_messages,
+                        'hours_elapsed': hours,
+                        'opt_out_reason': opt_out_reason,
+                    })
+
+                with st.expander(f"View {opt_outs:,} Opt-out Details"):
+                    if opt_out_categories:
+                        opt_out_df = pd.DataFrame(opt_out_details)
+                        category_counts = pd.Series(opt_out_categories).value_counts()
+
                         col1, col2 = st.columns(2)
-                        col3 = None
 
-                    with col1:
-                        total_opt_outs = len(opted_out_people)
-                        st.metric("Verified Opt-outs", f"{total_opt_outs}")
-                    with col2:
-                        opt_out_rate = (total_opt_outs / total_recipients * 100) if total_recipients > 0 else 0
-                        st.metric("Opt-out Rate", f"{opt_out_rate:.1f}%")
-                        st.caption("% of recipients who sent STOP")
-                    if col3:
-                        with col3:
-                            st.metric("AI Rejected (False Positives)", f"{len(ai_rejected_people)}")
-                            st.caption("Keyword matches that AI determined weren't opt-outs")
+                        with col1:
+                            colors = {'Opt-out only': '#EF553B', 'Replied before opting out': '#636EFA'}
+                            fig = px.bar(
+                                x=category_counts.index,
+                                y=category_counts.values,
+                                title="Opt-out Breakdown by Engagement",
+                                labels={'x': 'Engagement Type', 'y': 'Number of Opt-outs'},
+                                color=category_counts.index,
+                                color_discrete_map=colors
+                            )
+                            fig.update_layout(showlegend=False)
+                            st.plotly_chart(fig, use_container_width=True)
 
-                    # Analyze opt-outs by conversation engagement
-                    opt_out_categories = []
-                    opt_out_details = []
+                        with col2:
+                            st.subheader("Key Insights")
 
-                    for person_id in opted_out_people:
-                        person_messages = messages_df[messages_df['person_id'] == person_id].sort_values('created_at')
+                            optout_only_count = len(opt_out_df[opt_out_df['engagement_category'] == 'Opt-out only'])
+                            replied_count = len(opt_out_df[opt_out_df['engagement_category'] == 'Replied before opting out'])
 
-                        # Find the first STOP message for this person
-                        person_stop_msg = stop_messages[stop_messages['person_id'] == person_id].iloc[0]
-                        stop_time = person_stop_msg['created_at']
+                            st.metric("Opt-out only", f"{optout_only_count:,}",
+                                     help="Unsubscribed without any substantive reply — their only action was to opt out")
+                            st.metric("Replied before opting out", f"{replied_count:,}",
+                                     help="Had a real conversation before unsubscribing")
 
-                        # Get all incoming messages for this person
-                        person_incoming = person_messages[person_messages['direction'] == 'incoming']
+                            valid_hours = opt_out_df['hours_elapsed'].dropna()
+                            if len(valid_hours) > 0:
+                                avg_hours = valid_hours.mean()
+                                st.metric("Average time to opt-out", f"{avg_hours:.1f} hours")
 
-                        # Check if they had any non-STOP incoming messages before opting out
-                        # (i.e., did they reply or ask questions before sending STOP?)
-                        incoming_before_stop = person_incoming[person_incoming['created_at'] <= stop_time]
+                            if optout_only_count > 0:
+                                pct_immediate = (optout_only_count / len(opt_out_df)) * 100
+                                if pct_immediate > 50:
+                                    st.warning(f"⚠️ {pct_immediate:.0f}% opted out without any substantive reply")
 
-                        # Check for non-STOP messages (replies/questions) — standalone keyword match
-                        body_stripped = incoming_before_stop['body'].fillna('').str.lower().str.strip().str.replace(r'[^\w\s-]', '', regex=True).str.strip()
-                        non_stop_incoming = incoming_before_stop[~body_stripped.isin(stop_keywords)]
+                        # Opt-out reason breakdown
+                        if opt_out_df['opt_out_reason'].fillna('').str.strip().replace('', pd.NA).dropna().any():
+                            reason_counts = opt_out_df['opt_out_reason'].replace('', 'Unknown').value_counts()
+                            st.subheader("Opt-out Reasons")
+                            st.dataframe(reason_counts.reset_index().rename(columns={'index': 'Reason', 'opt_out_reason': 'Reason', 'count': 'Count'}), hide_index=True)
 
-                        had_conversation = len(non_stop_incoming) > 0
-                        num_replies_before_stop = len(non_stop_incoming)
+                        # Detailed table
+                        st.subheader("Individual Opt-out Details")
 
-                        # Count outgoing (bot) messages before STOP for context
-                        messages_before_stop = person_messages[person_messages['created_at'] <= stop_time]
-                        bot_messages_before = len(messages_before_stop[messages_before_stop['direction'] == 'outgoing'])
+                        def get_person_name_for_table(person_id):
+                            name = get_person_name(person_id, people_df)
+                            return name if name else f"Person {person_id}"
 
-                        # Find first bot message time for time calculation
-                        first_bot_msg = person_messages[person_messages['direction'] == 'outgoing']
-                        if len(first_bot_msg) > 0:
-                            first_bot_time = first_bot_msg.iloc[0]['created_at']
+                        opt_out_df['person_name'] = opt_out_df['person_id'].apply(get_person_name_for_table)
+                        opt_out_df['hours_rounded'] = opt_out_df['hours_elapsed'].round(1)
 
-                            if pd.notna(first_bot_time) and pd.notna(stop_time):
-                                time_diff = stop_time - first_bot_time
-                                hours = time_diff.total_seconds() / 3600
-
-                                # Categorize by conversation engagement
-                                if had_conversation:
-                                    engagement_category = "After conversation"
-                                else:
-                                    engagement_category = "Without conversation"
-
-                                opt_out_categories.append(engagement_category)
-                                # Get detection method if available
-                                detection = person_stop_msg.get('detection_method', 'Keyword') if 'detection_method' in person_stop_msg.index else 'Keyword'
-                                opt_out_details.append({
-                                    'person_id': person_id,
-                                    'engagement_category': engagement_category,
-                                    'replies_before_stop': num_replies_before_stop,
-                                    'bot_messages_before': bot_messages_before,
-                                    'hours_elapsed': hours,
-                                    'stop_message': person_stop_msg['body'],
-                                    'stop_time': stop_time,
-                                    'detection_method': detection
-                                })
-
-                    # Also add AI-rejected false positives to the details
-                    for person_id in ai_rejected_people:
-                        person_messages = messages_df[messages_df['person_id'] == person_id].sort_values('created_at')
-                        person_rejected_msg = ai_rejected_messages[ai_rejected_messages['person_id'] == person_id].iloc[0]
-
-                        # Get message info
-                        first_bot_msg = person_messages[person_messages['direction'] == 'outgoing']
-                        if len(first_bot_msg) > 0:
-                            first_bot_time = first_bot_msg.iloc[0]['created_at']
-                            msg_time = person_rejected_msg['created_at']
-
-                            if pd.notna(first_bot_time) and pd.notna(msg_time):
-                                hours = (msg_time - first_bot_time).total_seconds() / 3600
-                                bot_messages_before = len(person_messages[
-                                    (person_messages['direction'] == 'outgoing') &
-                                    (person_messages['created_at'] <= msg_time)
-                                ])
-
-                                opt_out_details.append({
-                                    'person_id': person_id,
-                                    'engagement_category': 'N/A (False Positive)',
-                                    'replies_before_stop': 0,
-                                    'bot_messages_before': bot_messages_before,
-                                    'hours_elapsed': hours,
-                                    'stop_message': person_rejected_msg['body'],
-                                    'stop_time': msg_time,
-                                    'detection_method': 'AI Rejected'
-                                })
-
-                    # Collapsible detailed analysis section
-                    total_analyzed = len(opted_out_people) + len(ai_rejected_people)
-                    expander_label = f"View {len(opted_out_people)} Opt-out(s)" + (f" + {len(ai_rejected_people)} AI-Rejected" if ai_rejected_people else "") + " Details"
-                    with st.expander(expander_label):
-                        if opt_out_categories:
-                            category_counts = pd.Series(opt_out_categories).value_counts()
-
-                            col1, col2 = st.columns(2)
-
-                            with col1:
-                                # Define colors for categories
-                                colors = {'Without conversation': '#EF553B', 'After conversation': '#636EFA'}
-                                fig = px.bar(
-                                    x=category_counts.index,
-                                    y=category_counts.values,
-                                    title="Opt-out Breakdown by Engagement",
-                                    labels={'x': 'Engagement Type', 'y': 'Number of Opt-outs'},
-                                    color=category_counts.index,
-                                    color_discrete_map=colors
-                                )
-                                fig.update_layout(showlegend=False)
-                                st.plotly_chart(fig, use_container_width=True)
-
-                            with col2:
-                                st.subheader("Key Insights")
-
-                                # Calculate statistics
-                                opt_out_df = pd.DataFrame(opt_out_details)
-
-                                # Count by category
-                                no_convo_count = len(opt_out_df[opt_out_df['engagement_category'] == 'Without conversation'])
-                                after_convo_count = len(opt_out_df[opt_out_df['engagement_category'] == 'After conversation'])
-
-                                st.metric("Opted out without conversation", f"{no_convo_count}",
-                                         help="People who only sent STOP without any prior replies")
-                                st.metric("Opted out after conversation", f"{after_convo_count}",
-                                         help="People who replied/asked questions before opting out")
-
-                                avg_hours = opt_out_df['hours_elapsed'].mean()
-                                st.metric("Average time to STOP", f"{avg_hours:.1f} hours")
-
-                                # Warning for immediate opt-outs
-                                if no_convo_count > 0:
-                                    pct_immediate = (no_convo_count / len(opt_out_df)) * 100
-                                    if pct_immediate > 50:
-                                        st.warning(f"⚠️ {pct_immediate:.0f}% opted out without any conversation")
-
-                            # Detailed table
-                            st.subheader("Individual Opt-out Details")
-                            opt_out_summary = pd.DataFrame(opt_out_details)
-
-                            # Add person names to the summary
-                            def get_person_name_for_table(person_id):
-                                name = get_person_name(person_id, people_df)
-                                return name if name else f"Person {person_id}"
-
-                            opt_out_summary['person_name'] = opt_out_summary['person_id'].apply(get_person_name_for_table)
-                            opt_out_summary['hours_rounded'] = opt_out_summary['hours_elapsed'].round(1)
-
-                            display_cols = ['person_name', 'engagement_category', 'replies_before_stop', 'bot_messages_before', 'hours_rounded', 'stop_message']
-                            col_config = {
-                                'person_name': 'Name',
-                                'engagement_category': 'Engagement',
-                                'replies_before_stop': 'Replies Before STOP',
-                                'bot_messages_before': 'Bot Messages',
-                                'hours_rounded': 'Hours to STOP',
-                                'stop_message': 'STOP Message'
-                            }
-                            # Add detection method column if LLM detection was used
-                            if use_llm_optout and 'detection_method' in opt_out_summary.columns:
-                                display_cols.insert(2, 'detection_method')
-                                col_config['detection_method'] = 'Detected By'
-                            st.dataframe(opt_out_summary[display_cols].rename(columns=col_config))
-                else:
-                    st.info("No STOP messages found in the conversation data")
+                        display_cols = ['person_name', 'engagement_category', 'replies', 'bot_messages', 'hours_rounded', 'opt_out_reason']
+                        col_config = {
+                            'person_name': 'Name',
+                            'engagement_category': 'Engagement',
+                            'replies': 'Replies',
+                            'bot_messages': 'Bot Messages',
+                            'hours_rounded': 'Hours to Opt-out',
+                            'opt_out_reason': 'Opt-out Reason'
+                        }
+                        opt_out_df = opt_out_df.sort_values(['engagement_category', 'replies'], ascending=[True, False])
+                        st.dataframe(opt_out_df[display_cols].rename(columns=col_config), hide_index=True)
+            else:
+                st.info("No opt-outs found in this campaign")
 
             # Committed responders detection
             st.header("✅ Committed Responders")
@@ -1846,7 +1638,7 @@ if messages_files and people_file:
                 export_ids = list(all_responder_ids_export)
                 filter_label = "all_responders"
             elif export_filter == "Opted Out":
-                export_ids = list(all_responder_ids_export & opted_out_people_set)
+                export_ids = list(opted_out_people_set)
                 filter_label = "opted_out"
             elif export_filter == "Active (Not Opted Out)":
                 export_ids = list(all_responder_ids_export - opted_out_people_set)
@@ -1983,7 +1775,7 @@ if messages_files and people_file:
                 filtered_ids = list(all_responder_ids)
                 filter_description = f"{len(filtered_ids)} responders"
             elif conversation_filter == "Opted Out":
-                filtered_ids = list(all_responder_ids & opted_out_people_set)
+                filtered_ids = list(opted_out_people_set)
                 filter_description = f"{len(filtered_ids)} opted out"
             elif conversation_filter == "Active (Not Opted Out)":
                 filtered_ids = list(all_responder_ids - opted_out_people_set)
@@ -2035,115 +1827,14 @@ if messages_files and people_file:
 
         with tab_variant:
 
-            # Import previous evaluation results
-            imported_eval_file = st.file_uploader(
-                "Import previous evaluation results", type=['json'],
-                help="Load results from a previous variant evaluation run to skip API calls",
-                key="variant_eval_import"
-            )
-
-            if imported_eval_file:
-                try:
-                    imported_data = json.loads(imported_eval_file.read())
-                    eval_results = {k: v for k, v in imported_data['eval_results'].items()}
-                    person_variant_map = imported_data['person_variant_map']
-                    responder_pids = set(imported_data.get('responder_ids', []))
-                    variant_optout_ids = set(imported_data.get('optout_ids', []))
-                    variant_names = sorted(set(person_variant_map.values()))
-
-                    variant_summary_df = aggregate_variant_metrics(eval_results, person_variant_map, responder_pids, variant_optout_ids)
-
-                    meta = imported_data.get('metadata', {})
-                    st.success(f"Loaded {meta.get('n_conversations', len(eval_results))} evaluation results (from {meta.get('timestamp', 'unknown')}, via {meta.get('provider', 'unknown')})")
-
-                    # Store in session state for display
-                    st.session_state['variant_eval_results'] = eval_results
-                    st.session_state['variant_eval_aggregated'] = variant_summary_df
-                    st.session_state['variant_eval_responder_ids'] = responder_pids
-                    st.session_state['variant_eval_optout_ids'] = variant_optout_ids
-                except Exception as e:
-                    st.error(f"Error loading evaluation results: {e}")
-                    imported_eval_file = None
-
-            if imported_eval_file and eval_results is not None and variant_summary_df is not None and not variant_summary_df.empty:
-                # Display imported results
-                m1, m2, m3 = st.columns(3)
-                with m1:
-                    st.metric("Variants", len(variant_names))
-                with m2:
-                    st.metric("Conversations Evaluated", len(eval_results))
-                with m3:
-                    avg_reply = variant_summary_df['_reply_rate'].mean()
-                    st.metric("Avg Reply Rate", f"{avg_reply:.1f}%")
-
-                display_cols = ['Variant', 'Total Recipients', 'Total Responders', 'Reply Rate', 'Opt-out Rate',
-                                'Active Responders',
-                                'Call Commit', 'Call Follow-through',
-                                'Letter Commit', 'Letter Follow-through',
-                                'Meeting Commit', 'Meeting Follow-through']
-                st.dataframe(variant_summary_df[display_cols], use_container_width=True, hide_index=True)
-
-                # Export re-share button
-                # Carry forward person_names from the imported data
-                _person_names = imported_data.get('person_names', {})
-                export_eval_data = {
-                    'eval_results': eval_results,
-                    'person_variant_map': {str(k): v for k, v in person_variant_map.items()},
-                    'responder_ids': [str(x) for x in responder_pids],
-                    'optout_ids': [str(x) for x in variant_optout_ids],
-                    'person_names': _person_names,
-                    'metadata': {
-                        'timestamp': pd.Timestamp.now().isoformat(),
-                        'provider': meta.get('provider', 'imported'),
-                        'n_conversations': len(eval_results),
-                    }
-                }
-                st.download_button(
-                    "⬇️ Export Variant Eval Results",
-                    data=json.dumps(export_eval_data, default=str),
-                    file_name=f"variant_eval_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.json",
-                    mime="application/json",
-                    key="export_imported_variant_eval"
-                )
-
-                # Per-variant details
-                _imported_names = imported_data.get('person_names', {})
-                for vname in variant_names:
-                    v_people = [pid for pid, v in person_variant_map.items() if v == vname]
-                    v_active = {
-                        pid: eval_results[pid] for pid in v_people
-                        if pid in eval_results and pid in responder_pids and pid not in variant_optout_ids
-                    }
-                    with st.expander(f"View {vname} - {len(v_active)} active responders"):
-                        detail_rows = []
-                        for pid, r in v_active.items():
-                            row = {'Person': _imported_names.get(str(pid)) or get_person_name(pid, people_df) or f"Person {pid}"}
-                            for action in ACTION_TYPES:
-                                label = action.title()
-                                commit_data = r.get(f'{action}_commitment', {})
-                                follow_data = r.get(f'{action}_followthrough', {})
-                                row[f'{label} Commit'] = f"{commit_data.get('answer', 'N/A')} ({commit_data.get('confidence', 0)}%)"
-                                row[f'{label} Follow-through'] = f"{follow_data.get('answer', 'N/A')} ({follow_data.get('confidence', 0)}%)"
-                                if commit_data.get('answer') == 'YES' and commit_data.get('summary'):
-                                    row[f'{label} Commit'] += f" - {commit_data['summary']}"
-                                if follow_data.get('answer') == 'YES' and follow_data.get('summary'):
-                                    row[f'{label} Follow-through'] += f" - {follow_data['summary']}"
-                            detail_rows.append(row)
-                        if detail_rows:
-                            st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
-                        else:
-                            st.caption("No active responders for this variant.")
-
-            elif 'message_variant_name' not in messages_df.columns:
-                st.info("No `message_variant_name` column found in Messages CSV. Add this column to outgoing messages to enable variant evaluation.")
-            elif not use_llm_variant_eval or not llm_api_key:
+            if not use_llm_variant_eval or not llm_api_key:
                 st.info("Enable **AI variant evaluation** in the sidebar and configure an API key to use this feature.")
             else:
                 # Derive person -> variant mapping from first outgoing message
                 person_variant_map = get_person_variant(messages_df)
 
                 if not person_variant_map:
-                    st.warning("No message variants found in outgoing messages.")
+                    st.warning("No outgoing messages found to evaluate.")
                 else:
                     variant_names = sorted(set(person_variant_map.values()))
                     n_conversations = len(person_variant_map)
@@ -2171,7 +1862,8 @@ if messages_files and people_file:
                     # Show run button if no cached results
                     if eval_results is None:
                         n_no_replies = n_conversations - n_with_replies
-                        st.caption(f"{n_conversations} recipients across {len(variant_names)} variants — {n_with_replies} replied ({n_no_replies} didn't reply, still counted toward variant totals). AI evaluation will run on {n_with_replies} conversations via {llm_provider.title()}.")
+                        variant_label = f"across {len(variant_names)} variants" if len(variant_names) > 1 else f"({variant_names[0]})"
+                        st.caption(f"{n_conversations} recipients {variant_label} — {n_with_replies} replied ({n_no_replies} didn't reply, still counted toward totals). AI evaluation will run on {n_with_replies} conversations via {llm_provider.title()}.")
                         run_variant_eval = st.button(f"Run Variant Evaluation ({n_with_replies} AI calls)", key="run_variant_eval")
 
                         if run_variant_eval:
@@ -2201,14 +1893,13 @@ if messages_files and people_file:
                                 progress_bar.empty()
                                 eval_results.update(llm_results)
 
-                            # Detect opt-outs via standalone keyword matching
-                            variant_stop_keywords = ['stop', 'unsubscribe', 'opt out', 'opt-out', 'remove', 'quit', 'cancel',
-                                                     'stopall', 'end', 'revoke', 'optout']
-                            variant_incoming = messages_df[messages_df['direction'] == 'incoming'].copy()
-                            body_stripped = variant_incoming['body'].fillna('').str.lower().str.strip().str.replace(r'[^\w\s-]', '', regex=True).str.strip()
-                            variant_optout_ids = set(variant_incoming[body_stripped.isin(variant_stop_keywords)]['person_id'].unique())
+                            # Reuse opt-out set from Campaign Analytics (broadcast-time-scoped)
+                            variant_optout_ids = opted_out_people_set & set(person_variant_map.keys())
 
-                            variant_summary_df = aggregate_variant_metrics(eval_results, person_variant_map, responder_pids, variant_optout_ids)
+                            # Count incoming messages per person for median calculation
+                            _reply_counts = messages_df[messages_df['direction'] == 'incoming'].groupby('person_id').size().to_dict()
+
+                            variant_summary_df = aggregate_variant_metrics(eval_results, person_variant_map, responder_pids, variant_optout_ids, _reply_counts)
 
                             # Cache results
                             st.session_state['variant_eval_cache_key'] = variant_eval_cache_key
@@ -2231,7 +1922,7 @@ if messages_files and people_file:
 
                         # Main comparison table
                         display_cols = ['Variant', 'Total Recipients', 'Total Responders', 'Reply Rate', 'Opt-out Rate',
-                                        'Active Responders',
+                                        'Active Responders', 'Median Active Responses',
                                         'Call Commit', 'Call Follow-through',
                                         'Letter Commit', 'Letter Follow-through',
                                         'Meeting Commit', 'Meeting Follow-through']
@@ -2245,6 +1936,7 @@ if messages_files and people_file:
                                 'Reply Rate': st.column_config.TextColumn('Reply Rate', help='Substantive reply rate — denominator: Total Recipients'),
                                 'Opt-out Rate': st.column_config.TextColumn('Opt-out Rate', help='Opt-out rate — denominator: Total Recipients'),
                                 'Active Responders': st.column_config.TextColumn('Active Responders', help='Responders who did not opt out — denominator: Total Recipients'),
+                                'Median Active Responses': st.column_config.NumberColumn('Median Active Responses', help='Active response messages per active conversation'),
                                 'Call Commit': st.column_config.TextColumn('Call Commit', help='Committed to making a phone call — denominator: Active Responders'),
                                 'Call Follow-through': st.column_config.TextColumn('Call Follow-through', help='Reported making the call — denominator: Call Commit count'),
                                 'Letter Commit': st.column_config.TextColumn('Letter Commit', help='Committed to writing a letter or email — denominator: Active Responders'),
@@ -2261,11 +1953,14 @@ if messages_files and people_file:
                             name = get_person_name(pid, people_df)
                             if name:
                                 _person_names[str(pid)] = name
+                        # Build reply counts for export (from messages_df if available, else from cached)
+                        _export_reply_counts = messages_df[messages_df['direction'] == 'incoming'].groupby('person_id').size().to_dict() if 'direction' in messages_df.columns else {}
                         export_eval_data = {
-                            'eval_results': eval_results,
+                            'eval_results': {str(k): v for k, v in eval_results.items()},
                             'person_variant_map': {str(k): v for k, v in person_variant_map.items()},
                             'responder_ids': [str(x) for x in st.session_state.get('variant_eval_responder_ids', set())],
                             'optout_ids': [str(x) for x in st.session_state.get('variant_eval_optout_ids', set())],
+                            'person_reply_counts': {str(k): int(v) for k, v in _export_reply_counts.items()},
                             'person_names': _person_names,
                             'metadata': {
                                 'timestamp': pd.Timestamp.now().isoformat(),
@@ -2347,7 +2042,8 @@ else:
             variant_optout_ids = set(imported_data.get('optout_ids', []))
             variant_names = sorted(set(person_variant_map.values()))
 
-            variant_summary_df = aggregate_variant_metrics(eval_results, person_variant_map, responder_pids, variant_optout_ids)
+            _imported_reply_counts = imported_data.get('person_reply_counts', {})
+            variant_summary_df = aggregate_variant_metrics(eval_results, person_variant_map, responder_pids, variant_optout_ids, _imported_reply_counts)
 
             meta = imported_data.get('metadata', {})
             st.success(f"Loaded {meta.get('n_conversations', len(eval_results))} evaluation results (from {meta.get('timestamp', 'unknown')}, via {meta.get('provider', 'unknown')})")
@@ -2363,11 +2059,30 @@ else:
                 st.metric("Avg Reply Rate", f"{avg_reply:.1f}%")
 
             display_cols = ['Variant', 'Total Recipients', 'Total Responders', 'Reply Rate', 'Opt-out Rate',
-                            'Active Responders',
+                            'Active Responders', 'Median Active Responses',
                             'Call Commit', 'Call Follow-through',
                             'Letter Commit', 'Letter Follow-through',
                             'Meeting Commit', 'Meeting Follow-through']
-            st.dataframe(variant_summary_df[display_cols], use_container_width=True, hide_index=True)
+            st.dataframe(
+                variant_summary_df[display_cols],
+                use_container_width=True,
+                column_config={
+                    'Variant': st.column_config.TextColumn('Variant', help='Message variant name from outgoing messages'),
+                    'Total Recipients': st.column_config.NumberColumn('Total Recipients', help='People who received this variant (with valid phone numbers)'),
+                    'Total Responders': st.column_config.NumberColumn('Total Responders', help='People who sent at least one reply'),
+                    'Reply Rate': st.column_config.TextColumn('Reply Rate', help='Substantive reply rate — denominator: Total Recipients'),
+                    'Opt-out Rate': st.column_config.TextColumn('Opt-out Rate', help='Opt-out rate — denominator: Total Recipients'),
+                    'Active Responders': st.column_config.TextColumn('Active Responders', help='Responders who did not opt out — denominator: Total Recipients'),
+                    'Median Active Responses': st.column_config.NumberColumn('Median Active Responses', help='Active response messages per active conversation'),
+                    'Call Commit': st.column_config.TextColumn('Call Commit', help='Committed to making a phone call — denominator: Active Responders'),
+                    'Call Follow-through': st.column_config.TextColumn('Call Follow-through', help='Reported making the call — denominator: Call Commit count'),
+                    'Letter Commit': st.column_config.TextColumn('Letter Commit', help='Committed to writing a letter or email — denominator: Active Responders'),
+                    'Letter Follow-through': st.column_config.TextColumn('Letter Follow-through', help='Reported sending the letter/email — denominator: Letter Commit count'),
+                    'Meeting Commit': st.column_config.TextColumn('Meeting Commit', help='Committed to attending an in-person meeting — denominator: Active Responders'),
+                    'Meeting Follow-through': st.column_config.TextColumn('Meeting Follow-through', help='Reported attending the meeting — denominator: Meeting Commit count'),
+                },
+                hide_index=True,
+            )
 
             # Per-variant details
             _standalone_names = imported_data.get('person_names', {})

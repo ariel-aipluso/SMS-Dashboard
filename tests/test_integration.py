@@ -17,7 +17,6 @@ from app import (
     get_person_name,
     format_conversation_for_llm,
     DEFAULT_COMMITMENT_PROMPT,
-    DEFAULT_OPTOUT_PROMPT,
 )
 
 
@@ -310,16 +309,3 @@ class TestPromptTemplates:
         # Has action mention
         assert "action" in prompt.lower()
 
-    def test_optout_prompt_has_required_elements(self):
-        """Opt-out prompt should have all required elements."""
-        prompt = DEFAULT_OPTOUT_PROMPT
-
-        # Has placeholder
-        assert "{conversation}" in prompt
-
-        # Has YES/NO instruction
-        assert "YES" in prompt
-        assert "NO" in prompt
-
-        # Mentions STOP
-        assert "STOP" in prompt or "stop" in prompt
