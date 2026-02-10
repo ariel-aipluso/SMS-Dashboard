@@ -139,9 +139,15 @@ def reconcile_message_files(uploaded_files):
     file_info = []
     dataframes = []
 
+    # Only keep columns the app actually uses (flow exports have ~130MB of unused state_data)
+    _msg_keep_cols = {'id', 'person_id', 'direction', 'body', 'created_at', 'sent_at', 'status',
+                      'message_variant_name', 'message_node_name', 'conversation_id', 'from', 'to',
+                      'phone_number_type', 'automation_id', 'automation_name', 'broadcast_id', 'broadcast_name'}
+
     for f in uploaded_files:
         chunks = pd.read_csv(f, chunksize=50000, low_memory=False)
         df = pd.concat(chunks, ignore_index=True)
+        df = df[[c for c in df.columns if c in _msg_keep_cols]]
 
         cols = set(df.columns)
         has_variant = 'message_variant_name' in cols
