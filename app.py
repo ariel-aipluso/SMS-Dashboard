@@ -148,7 +148,7 @@ def reconcile_message_files(uploaded_files):
     dataframes = []
 
     for f in uploaded_files:
-        chunks = pd.read_csv(f, chunksize=50000)
+        chunks = pd.read_csv(f, chunksize=50000, low_memory=False)
         df = pd.concat(chunks, ignore_index=True)
 
         cols = set(df.columns)
@@ -796,7 +796,7 @@ if messages_files and people_file:
     try:
         messages_df, file_info = reconcile_message_files(messages_files)
 
-        people_chunks = pd.read_csv(people_file, chunksize=50000)
+        people_chunks = pd.read_csv(people_file, chunksize=50000, low_memory=False)
         people_df = pd.concat(people_chunks, ignore_index=True)
 
         # Parse tags early for exclusion filter
@@ -1150,7 +1150,7 @@ if messages_files and people_file:
                     title="Response Engagement Levels",
                     labels={'x': 'Engagement Level', 'y': 'Number of People'}
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
 
             with col2:
                 # Response distribution
@@ -1162,7 +1162,7 @@ if messages_files and people_file:
                         title="Distribution of Response Counts",
                         labels={'response_count': 'Number of Responses', 'count': 'Number of People'}
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width='stretch')
 
             # Opt-out timing analysis
             st.header("⏰ Opt-out Timing Analysis")
@@ -1257,7 +1257,7 @@ if messages_files and people_file:
                                 color_discrete_map=colors
                             )
                             fig.update_layout(showlegend=False)
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, width='stretch')
 
                         with col2:
                             st.subheader("Key Insights")
@@ -1496,7 +1496,7 @@ if messages_files and people_file:
                         display_df = all_df[display_cols].copy()
                         display_df.columns = col_names
 
-                        st.dataframe(display_df, use_container_width=True, column_config=column_config)
+                        st.dataframe(display_df, width='stretch', column_config=column_config)
                 else:
                     st.info("No action commitments detected in the conversation data")
 
@@ -1565,7 +1565,7 @@ if messages_files and people_file:
                         display_df = multiplier_df[['person_name', 'commitment_date_formatted', 'raw_message']].copy()
                         display_df.columns = ['Person', 'Commitment Date', 'Message']
 
-                        st.dataframe(display_df, use_container_width=True)
+                        st.dataframe(display_df, width='stretch')
                 else:
                     st.info("No network multiplier commitments detected in the conversation data")
 
@@ -1928,7 +1928,7 @@ if messages_files and people_file:
                                         'Meeting Commit', 'Meeting Follow-through']
                         st.dataframe(
                             variant_summary_df[display_cols],
-                            use_container_width=True,
+                            width='stretch',
                             column_config={
                                 'Variant': st.column_config.TextColumn('Variant', help='Message variant name from outgoing messages'),
                                 'Total Recipients': st.column_config.NumberColumn('Total Recipients', help='People who received this variant (with valid phone numbers)'),
@@ -2015,7 +2015,7 @@ if messages_files and people_file:
                                             row[f'{label} Follow-through'] += f" - {follow_data['summary']}"
                                     detail_rows.append(row)
                                 if detail_rows:
-                                    st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+                                    st.dataframe(pd.DataFrame(detail_rows), width='stretch', hide_index=True)
                                 else:
                                     st.caption("No active responders for this variant.")
 
@@ -2065,7 +2065,7 @@ else:
                             'Meeting Commit', 'Meeting Follow-through']
             st.dataframe(
                 variant_summary_df[display_cols],
-                use_container_width=True,
+                width='stretch',
                 column_config={
                     'Variant': st.column_config.TextColumn('Variant', help='Message variant name from outgoing messages'),
                     'Total Recipients': st.column_config.NumberColumn('Total Recipients', help='People who received this variant (with valid phone numbers)'),
@@ -2108,7 +2108,7 @@ else:
                                 row[f'{label} Follow-through'] += f" - {follow_data['summary']}"
                         detail_rows.append(row)
                     if detail_rows:
-                        st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+                        st.dataframe(pd.DataFrame(detail_rows), width='stretch', hide_index=True)
                     else:
                         st.caption("No active responders for this variant.")
         except Exception as e:
