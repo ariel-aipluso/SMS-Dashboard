@@ -2116,7 +2116,7 @@ else:
     if not json_only_file:
         st.markdown("---")
         st.header("📂 Upload Files for Your Own Analysis")
-        st.info("👆 Upload Messages CSV file(s) and a People CSV file in the sidebar to begin")
+        st.info("👈 Upload Messages CSV file(s) and a People CSV file in the sidebar to begin")
         with st.expander("Expected CSV Structure"):
             st.markdown("""
             **Messages CSV(s)** — upload one or more of these export types:
