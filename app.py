@@ -716,7 +716,7 @@ if ANTHROPIC_AVAILABLE or OPENAI_AVAILABLE:
         # Build list of available providers from centralized keys
         available_providers = []
         if centralized_anthropic:
-            available_providers.append("Anthropic (Claude)")
+            available_providers.append("Anthropic (Sonnet 4)")
         if centralized_openai:
             available_providers.append("OpenAI (GPT-4o-mini)")
 
@@ -744,7 +744,7 @@ if ANTHROPIC_AVAILABLE or OPENAI_AVAILABLE:
                 anthropic_key_override = st.text_input(
                     "Anthropic API Key",
                     type="password",
-                    help="From console.anthropic.com (uses Claude Haiku)"
+                    help="From console.anthropic.com (uses Sonnet 4)"
                 )
 
             if OPENAI_AVAILABLE:
