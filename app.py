@@ -130,6 +130,7 @@ def get_person_name(person_id, people_df):
                 return str(name_val)
     return None
 
+@st.cache_data(show_spinner="Loading message files...")
 def reconcile_message_files(uploaded_files):
     """Load and reconcile multiple message CSV files using 'id' as primary key."""
     if not uploaded_files:
@@ -162,6 +163,14 @@ def reconcile_message_files(uploaded_files):
         else:
             export_type = 'Unknown'
 
+        # Block files too large for cloud hosting (e.g. full All Messages exports)
+        _MAX_ROWS = 100_000
+        if len(df) > _MAX_ROWS:
+            raise ValueError(
+                f"'{f.name}' has {len(df):,} rows — too large for cloud hosting (limit: {_MAX_ROWS:,}). "
+                f"Please upload per-campaign exports (Campaign or Flow) instead of the full All Messages export."
+            )
+
         file_info.append({
             'filename': f.name,
             'rows': len(df),
@@ -184,6 +193,16 @@ def reconcile_message_files(uploaded_files):
         messages_df = pd.concat(dataframes, ignore_index=True)
 
     return messages_df, file_info
+
+@st.cache_data(show_spinner="Loading people file...")
+def load_people_file(people_file):
+    """Load people CSV and drop unused columns to save memory."""
+    chunks = pd.read_csv(people_file, chunksize=50000, low_memory=False)
+    people_df = pd.concat(chunks, ignore_index=True)
+    _keep_cols = {'id', 'first_name', 'last_name', 'name', 'tags',
+                  'sms_subscribed', 'sms_opt_out_at', 'sms_opt_out_reason',
+                  'phone', 'phone_number', 'mobile', 'cell'}
+    return people_df[[c for c in people_df.columns if c in _keep_cols]]
 
 # LLM-based verification using Claude or OpenAI (conversation-aware)
 def format_conversation_for_llm(person_messages_df):
@@ -797,14 +816,7 @@ if messages_files and people_file:
     try:
         messages_df, file_info = reconcile_message_files(messages_files)
 
-        people_chunks = pd.read_csv(people_file, chunksize=50000, low_memory=False)
-        people_df = pd.concat(people_chunks, ignore_index=True)
-
-        # Drop unused columns to save memory (~80-90MB on large people files)
-        _keep_cols = {'id', 'first_name', 'last_name', 'name', 'tags',
-                      'sms_subscribed', 'sms_opt_out_at', 'sms_opt_out_reason',
-                      'phone', 'phone_number', 'mobile', 'cell'}
-        people_df = people_df[[c for c in people_df.columns if c in _keep_cols]]
+        people_df = load_people_file(people_file)
 
         # Parse tags early for exclusion filter
         excluded_tags = []
