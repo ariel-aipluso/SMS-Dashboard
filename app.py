@@ -454,7 +454,8 @@ def _variant_eval_fallback():
     }
 
 VARIANT_EVAL_MAX_WORKERS = 10
-VARIANT_EVAL_MAX_RETRIES = 3
+VARIANT_EVAL_OPENAI_MAX_WORKERS = 3
+VARIANT_EVAL_MAX_RETRIES = 5
 
 def _api_call_with_retry(fn, max_retries=VARIANT_EVAL_MAX_RETRIES):
     """Call fn() with exponential backoff on rate limit / server errors."""
@@ -465,7 +466,7 @@ def _api_call_with_retry(fn, max_retries=VARIANT_EVAL_MAX_RETRIES):
             err_str = str(e).lower()
             is_retryable = any(k in err_str for k in ['rate', '429', '529', 'overloaded', 'timeout', 'capacity'])
             if is_retryable and attempt < max_retries - 1:
-                time.sleep(2 ** attempt + 1)
+                time.sleep(2 ** attempt * 2 + 1)
                 continue
             return None, str(e)
 
@@ -541,7 +542,7 @@ def analyze_variant_eval_with_openai(conversations: dict, api_key: str, custom_p
     errors = []
     completed = 0
     total = len(conversations)
-    with ThreadPoolExecutor(max_workers=VARIANT_EVAL_MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=VARIANT_EVAL_OPENAI_MAX_WORKERS) as executor:
         futures = {executor.submit(_eval_one, pid, conv): pid for pid, conv in conversations.items()}
         for future in as_completed(futures):
             person_id, result, err = future.result()
