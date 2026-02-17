@@ -67,3 +67,5 @@ This dashboard is designed for SMS campaigns with:
 ## Support
 
 For questions about this dashboard, please open an issue in this repository or contact the development team.
+
+This is a test sentence added to the README.
