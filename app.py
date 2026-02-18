@@ -2019,6 +2019,10 @@ if _has_fresh_upload or _cached_session is not None:
                             variant_summary_df = _disk_variant['variant_summary_df']
                             cached_responder_ids = _disk_variant.get('responder_ids', set())
                             cached_optout_ids = _disk_variant.get('optout_ids', set())
+                            # Restore person_variant_map from cache to avoid type mismatches
+                            if 'person_variant_map' in _disk_variant:
+                                person_variant_map = _disk_variant['person_variant_map']
+                                variant_names = sorted(set(person_variant_map.values()))
                             st.session_state['variant_eval_cache_key'] = variant_eval_cache_key
                             st.session_state['variant_eval_results'] = eval_results
                             st.session_state['variant_eval_aggregated'] = variant_summary_df
@@ -2085,6 +2089,7 @@ if _has_fresh_upload or _cached_session is not None:
                                 'variant_summary_df': variant_summary_df,
                                 'responder_ids': responder_pids,
                                 'optout_ids': variant_optout_ids,
+                                'person_variant_map': person_variant_map,
                             })
 
                     # Display results if available
