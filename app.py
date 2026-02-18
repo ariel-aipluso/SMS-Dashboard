@@ -7,6 +7,10 @@ import re
 import os
 import json
 import time
+import uuid
+import pickle
+import shutil
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Check LLM availability without importing (saves ~100-150MB on idle)
@@ -63,6 +67,92 @@ st.title("📱 SMS Campaign Analytics Dashboard")
 st.markdown("*Interactive SMS Campaign Analysis Tool*")
 st.caption(f"Version: {get_version_date()}")
 
+# --- Session persistence (survive tab close / accidental navigation) ---
+_SESSION_TTL_HOURS = 24
+
+def _session_dir(sid: str) -> Path:
+    return Path(f"/tmp/sms_dashboard_{sid}")
+
+def save_session_data(sid: str, messages_df: pd.DataFrame, file_info: list, people_df: pd.DataFrame, people_filename: str = ""):
+    """Persist parsed DataFrames to disk so the session survives a tab close."""
+    d = _session_dir(sid)
+    d.mkdir(exist_ok=True)
+    with open(d / "messages.pkl", "wb") as f:
+        pickle.dump(messages_df, f)
+    with open(d / "file_info.pkl", "wb") as f:
+        pickle.dump(file_info, f)
+    with open(d / "people.pkl", "wb") as f:
+        pickle.dump(people_df, f)
+    with open(d / "meta.pkl", "wb") as f:
+        pickle.dump({'people_filename': people_filename}, f)
+    # Clean up expired sessions from other users
+    _cleanup_old_sessions()
+
+def load_session_data(sid: str):
+    """Load cached session data from disk. Returns (messages_df, file_info, people_df, meta) or None."""
+    d = _session_dir(sid)
+    try:
+        msgs_path = d / "messages.pkl"
+        if not msgs_path.exists():
+            return None
+        # Check TTL
+        age_hours = (time.time() - msgs_path.stat().st_mtime) / 3600
+        if age_hours > _SESSION_TTL_HOURS:
+            shutil.rmtree(d, ignore_errors=True)
+            return None
+        with open(d / "messages.pkl", "rb") as f:
+            messages_df = pickle.load(f)
+        with open(d / "file_info.pkl", "rb") as f:
+            file_info = pickle.load(f)
+        with open(d / "people.pkl", "rb") as f:
+            people_df = pickle.load(f)
+        meta = {}
+        meta_path = d / "meta.pkl"
+        if meta_path.exists():
+            with open(meta_path, "rb") as f:
+                meta = pickle.load(f)
+        return messages_df, file_info, people_df, meta
+    except Exception:
+        return None
+
+def save_eval_results(sid: str, eval_type: str, data: dict):
+    """Persist LLM eval results to disk so they survive a tab close."""
+    d = _session_dir(sid)
+    if not d.exists():
+        return
+    with open(d / f"{eval_type}_eval.pkl", "wb") as f:
+        pickle.dump(data, f)
+
+def load_eval_results(sid: str, eval_type: str):
+    """Load cached eval results from disk. Returns dict or None."""
+    p = _session_dir(sid) / f"{eval_type}_eval.pkl"
+    try:
+        if not p.exists():
+            return None
+        with open(p, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+def clear_session_data(sid: str):
+    shutil.rmtree(_session_dir(sid), ignore_errors=True)
+
+def _cleanup_old_sessions():
+    """Remove session dirs older than TTL."""
+    for p in Path("/tmp").glob("sms_dashboard_*"):
+        try:
+            age_hours = (time.time() - p.stat().st_mtime) / 3600
+            if age_hours > _SESSION_TTL_HOURS:
+                shutil.rmtree(p, ignore_errors=True)
+        except Exception:
+            pass
+
+# Generate or restore a session ID via URL query param
+_sid = st.query_params.get("sid")
+if not _sid:
+    _sid = uuid.uuid4().hex[:8]
+    st.query_params["sid"] = _sid
+
 # File upload section
 with st.sidebar.expander("📂 Data Upload", expanded=True):
     messages_files = st.file_uploader(
@@ -70,6 +160,20 @@ with st.sidebar.expander("📂 Data Upload", expanded=True):
         help="Upload one or more message exports (Campaign, Flow, All Messages). Files with the same message IDs will be merged."
     )
     people_file = st.file_uploader("Upload People CSV", type=['csv'])
+    # Show cached filenames and clear button when restoring from disk
+    if not (messages_files and people_file):
+        _peek = load_session_data(_sid)
+        if _peek is not None:
+            _, _peek_info, _, _peek_meta = _peek
+            _cached_names = [f['filename'] for f in _peek_info]
+            _people_name = _peek_meta.get('people_filename', '')
+            if _people_name:
+                _cached_names.append(_people_name)
+            st.caption("Cached files: " + ", ".join(_cached_names))
+            if st.button("Clear cached session", key="clear_session"):
+                clear_session_data(_sid)
+                st.query_params["sid"] = uuid.uuid4().hex[:8]
+                st.rerun()
 
 def normalize_phone(phone):
     """Normalize phone number for comparison - handles floats, +1, formatting."""
@@ -695,14 +799,19 @@ llm_api_key = None
 
 if ANTHROPIC_AVAILABLE or OPENAI_AVAILABLE:
     st.sidebar.caption("Select which features to enable:")
+    # Pre-check boxes when cached results exist on disk (only set default once)
+    if 'use_llm_commitment' not in st.session_state:
+        st.session_state['use_llm_commitment'] = load_eval_results(_sid, "commitment") is not None
+    if 'use_llm_variant_eval' not in st.session_state:
+        st.session_state['use_llm_variant_eval'] = load_eval_results(_sid, "variant") is not None
     use_llm_commitment = st.sidebar.checkbox(
         "AI commitment verification",
-        value=False,
+        key="use_llm_commitment",
         help="Uses AI to detect commitments in all conversations"
     )
     use_llm_variant_eval = st.sidebar.checkbox(
         "AI variant evaluation",
-        value=False,
+        key="use_llm_variant_eval",
         help="Uses AI to evaluate reply, opt-out, commitment, and follow-through per conversation grouped by message variant"
     )
 
@@ -812,12 +921,20 @@ else:
 commitment_prompt_template = st.session_state.get('custom_commitment_prompt', DEFAULT_COMMITMENT_PROMPT)
 variant_eval_prompt_template = st.session_state.get('custom_variant_eval_prompt', DEFAULT_VARIANT_EVAL_PROMPT)
 
-if messages_files and people_file:
-    # Load data (messages first - higher priority)
-    try:
-        messages_df, file_info = reconcile_message_files(messages_files)
+_has_fresh_upload = bool(messages_files and people_file)
+_cached_session = None if _has_fresh_upload else load_session_data(_sid)
 
-        people_df = load_people_file(people_file)
+if _has_fresh_upload or _cached_session is not None:
+    # Load data: fresh upload or restored from disk cache
+    try:
+        if _has_fresh_upload:
+            messages_df, file_info = reconcile_message_files(messages_files)
+            people_df = load_people_file(people_file)
+            save_session_data(_sid, messages_df, file_info, people_df,
+                              people_filename=people_file.name)
+        else:
+            messages_df, file_info, people_df, _meta = _cached_session
+            st.sidebar.success("Restored data from previous session")
 
         # Parse tags early for exclusion filter
         excluded_tags = []
@@ -1334,14 +1451,32 @@ if messages_files and people_file:
                 # Create cache key for commitment detection
                 commitment_cache_key = f"commit_{len(messages_df)}_{use_llm_commitment}_{llm_provider}_{hash(commitment_prompt_template)}_{len(opted_out_people_set)}"
 
-                # Check if we have cached results
+                # Check if we have cached results (session_state first, then disk)
+                _commitment_cached = False
                 if 'commitment_cache_key' in st.session_state and st.session_state.get('commitment_cache_key') == commitment_cache_key:
                     committed_people = st.session_state['committed_people']
                     rejected_people = st.session_state['rejected_people']
                     llm_verified_count = st.session_state.get('llm_verified_count', 0)
                     llm_rejected_count = st.session_state.get('llm_rejected_count', 0)
                     llm_unknown_count = st.session_state.get('llm_unknown_count', 0)
-                else:
+                    _commitment_cached = True
+                if not _commitment_cached:
+                    _disk_commit = load_eval_results(_sid, "commitment")
+                    if _disk_commit and _disk_commit.get('cache_key') == commitment_cache_key:
+                        committed_people = _disk_commit['committed_people']
+                        rejected_people = _disk_commit['rejected_people']
+                        llm_verified_count = _disk_commit.get('llm_verified_count', 0)
+                        llm_rejected_count = _disk_commit.get('llm_rejected_count', 0)
+                        llm_unknown_count = _disk_commit.get('llm_unknown_count', 0)
+                        # Hydrate session_state so subsequent reruns use memory
+                        st.session_state['commitment_cache_key'] = commitment_cache_key
+                        st.session_state['committed_people'] = committed_people
+                        st.session_state['rejected_people'] = rejected_people
+                        st.session_state['llm_verified_count'] = llm_verified_count
+                        st.session_state['llm_rejected_count'] = llm_rejected_count
+                        st.session_state['llm_unknown_count'] = llm_unknown_count
+                        _commitment_cached = True
+                if not _commitment_cached:
                     llm_verified_count = 0
                     llm_rejected_count = 0
                     llm_unknown_count = 0
@@ -1444,13 +1579,22 @@ if messages_files and people_file:
 
                         committed_people = keyword_committed_people
 
-                    # Cache the results
+                    # Cache the results (session_state + disk)
                     st.session_state['commitment_cache_key'] = commitment_cache_key
                     st.session_state['committed_people'] = committed_people
                     st.session_state['rejected_people'] = rejected_people
                     st.session_state['llm_verified_count'] = llm_verified_count
                     st.session_state['llm_rejected_count'] = llm_rejected_count
                     st.session_state['llm_unknown_count'] = llm_unknown_count
+                    if use_llm_commitment:
+                        save_eval_results(_sid, "commitment", {
+                            'cache_key': commitment_cache_key,
+                            'committed_people': committed_people,
+                            'rejected_people': rejected_people,
+                            'llm_verified_count': llm_verified_count,
+                            'llm_rejected_count': llm_rejected_count,
+                            'llm_unknown_count': llm_unknown_count,
+                        })
 
                 # Show LLM results (whether cached or fresh)
                 if use_llm_commitment and llm_provider and llm_api_key:
@@ -1859,6 +2003,7 @@ if messages_files and people_file:
                         f"_{llm_provider}_{hash(variant_eval_prompt_template)}"
                     )
 
+                    _variant_cached = False
                     if ('variant_eval_cache_key' in st.session_state
                             and st.session_state.get('variant_eval_cache_key') == variant_eval_cache_key
                             and 'variant_eval_results' in st.session_state):
@@ -1866,7 +2011,21 @@ if messages_files and people_file:
                         variant_summary_df = st.session_state['variant_eval_aggregated']
                         cached_responder_ids = st.session_state.get('variant_eval_responder_ids', set())
                         cached_optout_ids = st.session_state.get('variant_eval_optout_ids', set())
-                    else:
+                        _variant_cached = True
+                    if not _variant_cached:
+                        _disk_variant = load_eval_results(_sid, "variant")
+                        if _disk_variant and _disk_variant.get('cache_key') == variant_eval_cache_key:
+                            eval_results = _disk_variant['eval_results']
+                            variant_summary_df = _disk_variant['variant_summary_df']
+                            cached_responder_ids = _disk_variant.get('responder_ids', set())
+                            cached_optout_ids = _disk_variant.get('optout_ids', set())
+                            st.session_state['variant_eval_cache_key'] = variant_eval_cache_key
+                            st.session_state['variant_eval_results'] = eval_results
+                            st.session_state['variant_eval_aggregated'] = variant_summary_df
+                            st.session_state['variant_eval_responder_ids'] = cached_responder_ids
+                            st.session_state['variant_eval_optout_ids'] = cached_optout_ids
+                            _variant_cached = True
+                    if not _variant_cached:
                         eval_results = None
                         variant_summary_df = None
                         cached_responder_ids = set()
@@ -1914,12 +2073,19 @@ if messages_files and people_file:
 
                             variant_summary_df = aggregate_variant_metrics(eval_results, person_variant_map, responder_pids, variant_optout_ids, _reply_counts)
 
-                            # Cache results
+                            # Cache results (session_state + disk)
                             st.session_state['variant_eval_cache_key'] = variant_eval_cache_key
                             st.session_state['variant_eval_results'] = eval_results
                             st.session_state['variant_eval_aggregated'] = variant_summary_df
                             st.session_state['variant_eval_responder_ids'] = responder_pids
                             st.session_state['variant_eval_optout_ids'] = variant_optout_ids
+                            save_eval_results(_sid, "variant", {
+                                'cache_key': variant_eval_cache_key,
+                                'eval_results': eval_results,
+                                'variant_summary_df': variant_summary_df,
+                                'responder_ids': responder_pids,
+                                'optout_ids': variant_optout_ids,
+                            })
 
                     # Display results if available
                     if eval_results is not None and variant_summary_df is not None and not variant_summary_df.empty:
