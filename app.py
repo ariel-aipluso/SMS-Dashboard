@@ -1215,8 +1215,9 @@ if _has_fresh_upload or _cached_session is not None:
                     (people_df['sms_subscribed'] == False) &
                     (people_df['sms_opt_out_at'].notna())
                 ].copy()
-                people_with_optout['_opt_out_at'] = pd.to_datetime(people_with_optout['sms_opt_out_at'], errors='coerce')
-                opted_out_after = set(people_with_optout[people_with_optout['_opt_out_at'] > broadcast_time]['id'])
+                people_with_optout['_opt_out_at'] = pd.to_datetime(people_with_optout['sms_opt_out_at'], errors='coerce', utc=True).dt.tz_localize(None)
+                broadcast_time_naive = pd.Timestamp(broadcast_time).tz_localize(None) if pd.Timestamp(broadcast_time).tzinfo else broadcast_time
+                opted_out_after = set(people_with_optout[people_with_optout['_opt_out_at'] > broadcast_time_naive]['id'])
                 opted_out_people_set = opted_out_after & outgoing_person_ids
                 optout_source = "people_file"
             elif not people_df.empty and 'sms_subscribed' in people_df.columns:
